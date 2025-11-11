@@ -5,6 +5,7 @@ import httpx
 
 from unison_common.consent import ConsentScopes, clear_consent_cache
 import os, sys
+from src.server import app as context_app
 
 
 def make_consent_app():
