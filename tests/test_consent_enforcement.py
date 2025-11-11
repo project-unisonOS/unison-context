@@ -5,7 +5,6 @@ import httpx
 
 from unison_common.consent import ConsentScopes, clear_consent_cache
 import os, sys
-from src.server import app as context_app
 
 
 def make_consent_app():
@@ -34,6 +33,10 @@ def make_consent_app():
 def test_context_kv_consent_enforced(monkeypatch):
     monkeypatch.setenv("UNISON_REQUIRE_CONSENT", "true")
     clear_consent_cache()
+    # Import server after setting env so REQUIRE_CONSENT is picked up
+    import importlib
+    server = importlib.import_module("src.server")
+    context_app = server.app
     consent_app = make_consent_app()
     consent_transport = httpx.ASGITransport(app=consent_app)
 
