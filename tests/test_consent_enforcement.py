@@ -32,10 +32,14 @@ def make_consent_app():
 
 def test_context_kv_consent_enforced(monkeypatch):
     monkeypatch.setenv("UNISON_REQUIRE_CONSENT", "true")
+    # Route consent introspection to the in-test ASGI app
+    monkeypatch.setenv("UNISON_CONSENT_HOST", "testserver")
+    monkeypatch.setenv("UNISON_CONSENT_PORT", "80")
     clear_consent_cache()
     # Import server after setting env so REQUIRE_CONSENT is picked up
     import importlib
     server = importlib.import_module("src.server")
+    server = importlib.reload(server)
     context_app = server.app
     consent_app = make_consent_app()
     consent_transport = httpx.ASGITransport(app=consent_app)
