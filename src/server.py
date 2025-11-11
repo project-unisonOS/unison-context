@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Body
+from fastapi import FastAPI, Request, Body, Depends
 import uvicorn
 import logging
 import json
@@ -7,16 +7,25 @@ import os
 from typing import Dict, Any, List
 from urllib.parse import quote
 from unison_common.logging import configure_logging, log_json
+from unison_common.tracing_middleware import TracingMiddleware
+from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
 from unison_common.http_client import http_put_json_with_retry, http_get_json_with_retry
+from unison_common.consent import require_consent, ConsentScopes
 from collections import defaultdict
 
 import httpx
 
 app = FastAPI(title="unison-context")
+app.add_middleware(TracingMiddleware, service_name="unison-context")
 
 _KV_STORE: Dict[str, Any] = {}
 
 logger = configure_logging("unison-context")
+
+# P0.3: Initialize tracing and instrument FastAPI/httpx
+initialize_tracing()
+instrument_fastapi(app)
+instrument_httpx()
 
 # Simple in-memory metrics
 _metrics = defaultdict(int)
@@ -24,6 +33,9 @@ _start_time = time.time()
 
 STORAGE_HOST = os.getenv("UNISON_STORAGE_HOST", "storage")
 STORAGE_PORT = os.getenv("UNISON_STORAGE_PORT", "8082")
+
+# Feature flag: require consent enforcement
+REQUIRE_CONSENT = os.getenv("UNISON_REQUIRE_CONSENT", "false").lower() == "true"
 
 
 def storage_put(key: str, value: Any) -> bool:
@@ -36,6 +48,7 @@ def storage_get(key: str) -> Any:
         return None
     return body.get("value")
 
+@app.get("/healthz")
 @app.get("/health")
 def health(request: Request):
     _metrics["/health"] += 1
@@ -65,15 +78,21 @@ def metrics():
     ])
     return "\n".join(lines)
 
+@app.get("/readyz")
 @app.get("/ready")
 def ready(request: Request):
     event_id = request.headers.get("X-Event-ID")
     # Check downstream Storage health
     try:
-        url = f"http://{STORAGE_HOST}:{STORAGE_PORT}/health"
-        with httpx.Client(timeout=2.0) as client:
-            r = client.get(url, headers={"X-Event-ID": event_id})
-        storage_ok = r.status_code == 200
+        ok, status_code, _ = http_get_json_with_retry(
+            STORAGE_HOST,
+            STORAGE_PORT,
+            "/health",
+            headers={"X-Event-ID": event_id},
+            max_retries=1,
+            timeout=2.0,
+        )
+        storage_ok = ok and status_code == 200
     except Exception:
         storage_ok = False
     ready = storage_ok
@@ -108,7 +127,11 @@ def profile_export(request: Request, body: Dict[str, Any] = Body(...)):
 
 
 @app.post("/kv/put")
-def kv_put(request: Request, body: Dict[str, Any] = Body(...)):
+def kv_put(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+    consent=Depends(require_consent([ConsentScopes.INGEST_WRITE])) if REQUIRE_CONSENT else None,
+):
     """
     Stores multiple key/value pairs with person-scoped, tier-aware checks.
     Expected body: { person_id: str, tier: 'A'|'B'|'C', items: { key: value, ... } }
@@ -153,7 +176,11 @@ def kv_put(request: Request, body: Dict[str, Any] = Body(...)):
 
 
 @app.post("/kv/set")
-def kv_set(request: Request, body: Dict[str, Any] = Body(...)):
+def kv_set(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+    consent=Depends(require_consent([ConsentScopes.INGEST_WRITE])) if REQUIRE_CONSENT else None,
+):
     _metrics["/kv/set"] += 1
     event_id = request.headers.get("X-Event-ID")
     key = body.get("key")
@@ -166,7 +193,11 @@ def kv_set(request: Request, body: Dict[str, Any] = Body(...)):
 
 
 @app.post("/kv/get")
-def kv_get(request: Request, body: Dict[str, Any] = Body(...)):
+def kv_get(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+    consent=Depends(require_consent([ConsentScopes.REPLAY_READ])) if REQUIRE_CONSENT else None,
+):
     _metrics["/kv/get"] += 1
     event_id = request.headers.get("X-Event-ID")
     keys: List[str] = body.get("keys") or []
