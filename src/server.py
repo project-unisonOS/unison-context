@@ -3,7 +3,6 @@ import uvicorn
 import logging
 import json
 import time
-import os
 from typing import Dict, Any, List
 from urllib.parse import quote
 from unison_common.logging import configure_logging, log_json
@@ -14,6 +13,8 @@ from unison_common.consent import require_consent, ConsentScopes
 from collections import defaultdict
 
 import httpx
+
+from .settings import ContextServiceSettings
 
 app = FastAPI(title="unison-context")
 app.add_middleware(TracingMiddleware, service_name="unison-context")
@@ -31,11 +32,18 @@ instrument_httpx()
 _metrics = defaultdict(int)
 _start_time = time.time()
 
-STORAGE_HOST = os.getenv("UNISON_STORAGE_HOST", "storage")
-STORAGE_PORT = os.getenv("UNISON_STORAGE_PORT", "8082")
 
-# Feature flag: require consent enforcement
-REQUIRE_CONSENT = os.getenv("UNISON_REQUIRE_CONSENT", "false").lower() == "true"
+def load_settings() -> ContextServiceSettings:
+    """Load settings from the environment and refresh global shortcuts."""
+    settings = ContextServiceSettings.from_env()
+    globals()["SETTINGS"] = settings
+    globals()["STORAGE_HOST"] = settings.storage.host
+    globals()["STORAGE_PORT"] = settings.storage.port
+    globals()["REQUIRE_CONSENT"] = settings.require_consent
+    return settings
+
+
+load_settings()
 
 
 def storage_put(key: str, value: Any) -> bool:

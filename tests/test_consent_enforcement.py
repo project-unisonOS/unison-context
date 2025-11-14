@@ -1,10 +1,18 @@
+import importlib
+
 import pytest
 from fastapi.testclient import TestClient
 from fastapi import Request
 import httpx
 
 from unison_common.consent import ConsentScopes, clear_consent_cache
-import os, sys
+import src.server as context_server
+
+
+def _reload_context_server():
+    global context_server
+    context_server = importlib.reload(context_server)
+    return context_server
 
 
 def make_consent_app():
@@ -32,6 +40,7 @@ def make_consent_app():
 
 def test_context_kv_consent_enforced(monkeypatch):
     monkeypatch.setenv("UNISON_REQUIRE_CONSENT", "true")
+    server_mod = _reload_context_server()
     clear_consent_cache()
     consent_app = make_consent_app()
     consent_transport = httpx.ASGITransport(app=consent_app)
@@ -44,7 +53,7 @@ def test_context_kv_consent_enforced(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", _patched_async_client)
 
-    client = TestClient(context_app)
+    client = TestClient(server_mod.app)
 
     # GET requires REPLAY_READ
     r_forbidden = client.post("/kv/get", json={"keys": ["p1:profile:a"]}, headers={"Authorization": "Bearer none"})
