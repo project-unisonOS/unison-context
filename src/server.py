@@ -49,6 +49,7 @@ _conversation_store: Dict[str, Dict[str, Any]] = {}
 _DB_CONN: sqlite3.Connection = None
 _DB_PATH: Path = Path("/tmp/unison-context-conversation.db")
 _PROFILE_KEY: Optional[bytes] = None
+_DASHBOARD_MAX = 100
 
 
 def load_settings() -> ContextServiceSettings:
@@ -100,6 +101,15 @@ def _init_db():
         CREATE TABLE IF NOT EXISTS person_profiles (
             person_id TEXT PRIMARY KEY,
             profile_json TEXT,
+            updated_at REAL
+        )
+        """
+    )
+    _DB_CONN.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dashboard_state (
+            person_id TEXT PRIMARY KEY,
+            state_json TEXT,
             updated_at REAL
         )
         """
@@ -162,6 +172,54 @@ def _validate_policy_group(policy_group: str) -> bool:
     except Exception:
         return False
 
+
+# --- Dashboard state ---
+@dashboard_router.get("/dashboard/{person_id}")
+def dashboard_get(
+    person_id: str,
+    consent=Depends(require_consent([ConsentScopes.INGEST_READ])) if REQUIRE_CONSENT else None,
+    current_user: Dict[str, Any] = Depends(_role_guard),
+):
+    if not isinstance(person_id, str) or not person_id:
+        return {"ok": False, "error": "invalid-person-id"}
+    try:
+        row = _DB_CONN.execute(
+            "SELECT state_json, updated_at FROM dashboard_state WHERE person_id=?", (person_id,)
+        ).fetchone()
+        if not row:
+            return {"ok": True, "dashboard": None}
+        state_json, updated_at = row
+        state = json.loads(state_json) if state_json else {}
+        return {"ok": True, "dashboard": state, "updated_at": updated_at}
+    except Exception as exc:
+        log_json(logging.WARNING, "dashboard_get_error", service="unison-context", error=str(exc))
+        return {"ok": False, "error": "dashboard-fetch-failed"}
+
+
+@dashboard_router.post("/dashboard/{person_id}")
+def dashboard_put(
+    person_id: str,
+    body: Dict[str, Any] = Body(...),
+    consent=Depends(require_consent([ConsentScopes.INGEST_WRITE])) if REQUIRE_CONSENT else None,
+    current_user: Dict[str, Any] = Depends(_role_guard),
+):
+    if not isinstance(person_id, str) or not person_id:
+        return {"ok": False, "error": "invalid-person-id"}
+    dashboard = body.get("dashboard")
+    if not isinstance(dashboard, dict):
+        return {"ok": False, "error": "invalid-dashboard"}
+    try:
+        state_json = json.dumps(dashboard)
+        _DB_CONN.execute(
+            "REPLACE INTO dashboard_state (person_id, state_json, updated_at) VALUES (?, ?, ?)",
+            (person_id, state_json, time.time()),
+        )
+        _DB_CONN.commit()
+        return {"ok": True, "person_id": person_id}
+    except Exception as exc:
+        log_json(logging.WARNING, "dashboard_put_error", service="unison-context", error=str(exc))
+        return {"ok": False, "error": "dashboard-store-failed"}
+
 @app.get("/healthz")
 @app.get("/health")
 def health(request: Request):
@@ -216,6 +274,7 @@ def ready(request: Request):
 # --- Conversation storage (companion loop) ---
 conv_router = APIRouter()
 profile_router = APIRouter()
+dashboard_router = APIRouter()
 
 @conv_router.get("/conversation/health")
 def conversation_health():
@@ -361,6 +420,7 @@ def profile_put(
 
 
 app.include_router(profile_router)
+app.include_router(dashboard_router)
 
 
 @app.post("/profile.export")
