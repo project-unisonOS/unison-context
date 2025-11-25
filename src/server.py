@@ -152,6 +152,31 @@ def _decrypt_profile(ciphertext: str) -> Dict[str, Any]:
         return json.loads(ciphertext) if ciphertext else {}
 
 
+def _encrypt_dashboard(state: Dict[str, Any]) -> str:
+    if not _PROFILE_KEY:
+        return json.dumps(state)
+    try:
+        from cryptography.fernet import Fernet
+
+        f = Fernet(_PROFILE_KEY)
+        return f.encrypt(json.dumps(state).encode("utf-8")).decode("utf-8")
+    except Exception:
+        return json.dumps(state)
+
+
+def _decrypt_dashboard(ciphertext: str) -> Dict[str, Any]:
+    if not _PROFILE_KEY:
+        return json.loads(ciphertext) if ciphertext else {}
+    try:
+        from cryptography.fernet import Fernet
+
+        f = Fernet(_PROFILE_KEY)
+        plaintext = f.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+        return json.loads(plaintext)
+    except Exception:
+        return json.loads(ciphertext) if ciphertext else {}
+
+
 # Initialize settings after helpers are defined
 load_settings()
 _init_db()
@@ -189,7 +214,7 @@ def dashboard_get(
         if not row:
             return {"ok": True, "dashboard": None}
         state_json, updated_at = row
-        state = json.loads(state_json) if state_json else {}
+        state = _decrypt_dashboard(state_json) if state_json else {}
         return {"ok": True, "dashboard": state, "updated_at": updated_at}
     except Exception as exc:
         log_json(logging.WARNING, "dashboard_get_error", service="unison-context", error=str(exc))
@@ -209,7 +234,7 @@ def dashboard_put(
     if not isinstance(dashboard, dict):
         return {"ok": False, "error": "invalid-dashboard"}
     try:
-        state_json = json.dumps(dashboard)
+        state_json = _encrypt_dashboard(dashboard)
         _DB_CONN.execute(
             "REPLACE INTO dashboard_state (person_id, state_json, updated_at) VALUES (?, ?, ?)",
             (person_id, state_json, time.time()),
