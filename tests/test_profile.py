@@ -54,3 +54,33 @@ def test_profile_get_missing_returns_none():
     body = r.json()
     assert body.get("ok") is True
     assert body.get("profile") is None
+
+
+def test_profile_payments_sanitized():
+    client = TestClient(server.app, headers={"x-test-role": "admin"})
+    dirty_profile = {
+        "payments": {
+            "instruments": [
+                {
+                    "instrument_id": "i-1",
+                    "provider": "mock",
+                    "kind": "card",
+                    "last4": "123456",
+                    "token": "should_not_store",
+                },
+                "invalid",
+            ],
+            "preferences": {"default": "i-1"},
+        }
+    }
+    r = client.post("/profile/p1", json={"profile": dirty_profile})
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("ok") is True
+
+    r2 = client.get("/profile/p1")
+    assert r2.status_code == 200
+    profile = r2.json().get("profile")
+    assert profile["payments"]["instruments"][0]["last4"] == "3456"
+    # token should be stripped
+    assert "token" not in profile["payments"]["instruments"][0]

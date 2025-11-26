@@ -34,6 +34,10 @@ if BatonMiddleware:
     app.add_middleware(BatonMiddleware)
 
 _KV_STORE: Dict[str, Any] = {}
+# Routers are declared up-front so they can be referenced by later route decorators.
+conv_router = APIRouter()
+profile_router = APIRouter()
+dashboard_router = APIRouter()
 
 logger = configure_logging("unison-context")
 
@@ -198,6 +202,58 @@ def _validate_policy_group(policy_group: str) -> bool:
         return False
 
 
+def _sanitize_payments(payments: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove unexpected fields from payments profile data."""
+    if not isinstance(payments, dict):
+        return {}
+    instruments = payments.get("instruments", [])
+    cleaned_instruments = []
+    allowed_keys = {
+        "instrument_id",
+        "provider",
+        "kind",
+        "display_name",
+        "brand",
+        "last4",
+        "expiry",
+        "handle",
+        "vault_key",
+        "created_at",
+    }
+    for item in instruments if isinstance(instruments, list) else []:
+        if not isinstance(item, dict):
+            continue
+        entry = {k: item.get(k) for k in allowed_keys if k in item}
+        # Basic type normalization; avoid storing overly sensitive metadata.
+        if entry.get("last4") and isinstance(entry["last4"], str):
+            entry["last4"] = entry["last4"][-4:]
+        cleaned_instruments.append(entry)
+    result = {"instruments": cleaned_instruments}
+    # Optional preferences like defaults/limits can pass through if shaped safely.
+    prefs = payments.get("preferences")
+    if isinstance(prefs, dict):
+        result["preferences"] = prefs
+    return result
+
+
+# Minimal header-based auth helpers (used for tests/local dev)
+def _authorize(headers: Dict[str, Any]):
+    """Minimal header-based allow for tests; real deployments should rely on service tokens."""
+    role = headers.get("x-test-role")
+    if role and role in {"admin", "operator", "service"}:
+        return True
+    return False
+
+
+def _role_guard(x_test_role: Optional[str] = Header(default=None)):
+    if _authorize({"x-test-role": x_test_role}):
+        return {"roles": [x_test_role]}
+    # In production, this should be replaced by proper auth; here we return None to trigger 401
+    from fastapi import HTTPException
+
+    raise HTTPException(status_code=401, detail="unauthorized")
+
+
 # --- Dashboard state ---
 @dashboard_router.get("/dashboard/{person_id}")
 def dashboard_get(
@@ -297,10 +353,6 @@ def ready(request: Request):
     return {"ready": ready, "storage": {"host": STORAGE_HOST, "port": STORAGE_PORT, "ok": storage_ok}}
 
 # --- Conversation storage (companion loop) ---
-conv_router = APIRouter()
-profile_router = APIRouter()
-dashboard_router = APIRouter()
-
 @conv_router.get("/conversation/health")
 def conversation_health():
     try:
@@ -372,24 +424,6 @@ app.include_router(conv_router)
 
 
 # --- Person profile storage ---
-
-def _authorize(headers: Dict[str, Any]):
-    """Minimal header-based allow for tests; real deployments should rely on service tokens."""
-    role = headers.get("x-test-role")
-    if role and role in {"admin", "operator", "service"}:
-        return True
-    return False
-
-
-def _role_guard(x_test_role: Optional[str] = Header(default=None)):
-    if _authorize({"x-test-role": x_test_role}):
-        return {"roles": [x_test_role]}
-    # In production, this should be replaced by proper auth; here we return None to trigger 401
-    from fastapi import HTTPException
-
-    raise HTTPException(status_code=401, detail="unauthorized")
-
-
 @profile_router.get("/profile/{person_id}")
 def profile_get(
     person_id: str,
@@ -431,6 +465,8 @@ def profile_put(
         valid = _validate_policy_group(policy_group)
         if not valid:
             return {"ok": False, "error": "invalid-policy-group"}
+    if "payments" in profile:
+        profile["payments"] = _sanitize_payments(profile.get("payments"))
     try:
         stored = _encrypt_profile(profile)
         _DB_CONN.execute(
