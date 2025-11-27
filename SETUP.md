@@ -27,12 +27,16 @@ Recommended core repos to clone locally:
 - `unison-context`
 - `unison-storage`
 - `unison-devstack`
-- `unison-docs`
+- `unison-policy`
+- `unison-auth`
+- `unison-common`
 
 Keep all under a shared parent folder, e.g.:
 ```
 /git/unison/
 ```
+
+Workspace docs live at the root `docs/` directory; `unison-docs` is archived.
 
 ---
 
