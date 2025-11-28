@@ -22,7 +22,7 @@ cd unison-devstack
 ```
 
 Recommended core repos to clone locally:
-- `unison-spec`
+- `unison-docs` (specs and cross-cutting docs)
 - `unison-orchestrator`
 - `unison-context`
 - `unison-storage`

@@ -19,7 +19,7 @@ When changes span multiple modules:
 2. Run the full `unison-devstack` compose build locally.  
 3. Verify health checks and API compatibility.  
 4. Once validated, merge `dev` → `main` across all affected repos in this order:
-   1. `unison-spec`  
+   1. `unison-docs` (specs)  
    2. `unison-orchestrator`  
    3. `unison-context`  
    4. `unison-storage`  
