@@ -258,7 +258,7 @@ def _role_guard(x_test_role: Optional[str] = Header(default=None)):
 @dashboard_router.get("/dashboard/{person_id}")
 def dashboard_get(
     person_id: str,
-    consent=Depends(require_consent([ConsentScopes.INGEST_READ])) if REQUIRE_CONSENT else None,
+    consent=Depends(require_consent([ConsentScopes.INGEST_WRITE])) if REQUIRE_CONSENT else None,
     current_user: Dict[str, Any] = Depends(_role_guard),
 ):
     if not isinstance(person_id, str) or not person_id:
@@ -427,7 +427,7 @@ app.include_router(conv_router)
 @profile_router.get("/profile/{person_id}")
 def profile_get(
     person_id: str,
-    consent=Depends(require_consent([ConsentScopes.INGEST_READ])) if REQUIRE_CONSENT else None,
+    consent=Depends(require_consent([ConsentScopes.INGEST_WRITE])) if REQUIRE_CONSENT else None,
     current_user: Dict[str, Any] = Depends(_role_guard),
 ):
     if not isinstance(person_id, str) or not person_id:
