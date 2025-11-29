@@ -1,6 +1,7 @@
+FROM ghcr.io/project-unisonos/unison-common-wheel:latest AS common_wheel
 FROM python:3.12-slim
 
-ARG REPO_PATH="."
+ARG REPO_PATH="unison-context"
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl git ca-certificates \
@@ -8,7 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl git ca-cer
 
 COPY ${REPO_PATH}/constraints.txt ./constraints.txt
 COPY ${REPO_PATH}/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -c ./constraints.txt git+https://github.com/project-unisonOS/unison-common.git@main \
+COPY --from=common_wheel /tmp/wheels /tmp/wheels
+RUN pip install --no-cache-dir -c ./constraints.txt /tmp/wheels/unison_common-*.whl \
     && pip install --no-cache-dir -c ./constraints.txt -r requirements.txt
 
 COPY ${REPO_PATH}/src/ ./src/
