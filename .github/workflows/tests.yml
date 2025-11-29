@@ -35,4 +35,7 @@ jobs:
           python -m pip install pytest requests pytest-rerunfailures
 
       - name: Run pytest
+        env:
+            PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+            OTEL_SDK_DISABLED: "true"
         run: pytest -q --reruns 1 --maxfail=1 --durations=15
