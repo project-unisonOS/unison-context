@@ -290,6 +290,22 @@ def dashboard_put(
     if not isinstance(dashboard, dict):
         return {"ok": False, "error": "invalid-dashboard"}
     try:
+        cards = dashboard.get("cards")
+        if cards is not None:
+            if not isinstance(cards, list):
+                return {"ok": False, "error": "invalid-dashboard-cards"}
+            # Normalize to a bounded list of dicts to avoid untrusted growth.
+            cleaned_cards: List[Dict[str, Any]] = []
+            for card in cards:
+                if isinstance(card, dict):
+                    cleaned_cards.append(card)
+                if len(cleaned_cards) >= _DASHBOARD_MAX:
+                    break
+            dashboard["cards"] = cleaned_cards
+        # Stamp person_id and updated_at into the stored state when missing so callers
+        # can rely on these fields without re-deriving them.
+        dashboard.setdefault("person_id", person_id)
+        dashboard.setdefault("updated_at", time.time())
         state_json = _encrypt_dashboard(dashboard)
         _DB_CONN.execute(
             "REPLACE INTO dashboard_state (person_id, state_json, updated_at) VALUES (?, ?, ?)",
