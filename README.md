@@ -41,3 +41,6 @@ curl -X POST http://localhost:8081/dashboard/person-123 \
   -d '{"dashboard": {"cards": [{"id": "card-1", "type": "summary", "title": "Morning briefing", "body": "3 meetings today."}], "preferences": {"layout": "comms-first"}}}'
 ```
 
+## Docs
+
+Full docs at https://project-unisonos.github.io
