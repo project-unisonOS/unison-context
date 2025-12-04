@@ -3,6 +3,7 @@ import uvicorn
 import logging
 import json
 import time
+import os
 import sqlite3
 from base64 import urlsafe_b64decode
 from pathlib import Path
@@ -51,7 +52,7 @@ _metrics = defaultdict(int)
 _start_time = time.time()
 _conversation_store: Dict[str, Dict[str, Any]] = {}
 _DB_CONN: sqlite3.Connection = None
-_DB_PATH: Path = Path("/tmp/unison-context-conversation.db")
+_DB_PATH: Path = Path(os.getenv("UNISON_CONVERSATION_DB_PATH", "/tmp/unison-context-conversation.db"))
 _PROFILE_KEY: Optional[bytes] = None
 _DASHBOARD_MAX = 100
 

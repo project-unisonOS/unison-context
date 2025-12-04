@@ -6,29 +6,36 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+# Configure env and DB path before importing the server module to avoid locked SQLite handles.
+os.environ["UNISON_REQUIRE_CONSENT"] = "false"
+os.environ["UNISON_ALLOWED_HOSTS"] = "testclient,localhost,127.0.0.1"
+fd, path = tempfile.mkstemp()
+os.close(fd)
+os.environ["UNISON_CONVERSATION_DB_PATH"] = path
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 import server
+
 server._DB_CONN = None  # force re-init
 
 
 @pytest.fixture(autouse=True)
 def reset_profile_store():
-    os.environ["UNISON_REQUIRE_CONSENT"] = "false"
-    os.environ["UNISON_ALLOWED_HOSTS"] = "testclient,localhost,127.0.0.1"
-    fd, path = tempfile.mkstemp()
+    # Reset to a new temp DB per test to avoid locking issues on Windows/WSL paths.
+    fd, p = tempfile.mkstemp()
     os.close(fd)
-    # Ensure we start with a fresh connection for every test to avoid locked db
+    os.environ["UNISON_CONVERSATION_DB_PATH"] = p
     if server._DB_CONN:
         try:
             server._DB_CONN.close()
         except Exception:
             pass
     server._DB_CONN = None
-    server._DB_PATH = Path(path)
+    server._DB_PATH = Path(p)
     server._init_db()
     yield
     try:
-        os.remove(path)
+        os.remove(p)
     except OSError:
         pass
 
