@@ -483,6 +483,9 @@ def profile_put(
             return {"ok": False, "error": "invalid-policy-group"}
     if "payments" in profile:
         profile["payments"] = _sanitize_payments(profile.get("payments"))
+    # Ensure unison_id is present for Unison-to-Unison addressing; default to person_id if missing.
+    if not profile.get("unison_id"):
+        profile["unison_id"] = person_id
     try:
         stored = _encrypt_profile(profile)
         _DB_CONN.execute(

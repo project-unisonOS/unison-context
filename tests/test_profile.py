@@ -45,6 +45,8 @@ def test_profile_put_and_get_round_trip():
     body2 = r2.json()
     assert body2.get("ok") is True
     assert body2.get("profile", {}).get("preferences", {}).get("language") == "en"
+    # unison_id should default to person_id
+    assert body2.get("profile", {}).get("unison_id") == "p1"
 
 
 def test_profile_get_missing_returns_none():
