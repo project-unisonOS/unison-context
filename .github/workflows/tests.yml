@@ -38,4 +38,5 @@ jobs:
         env:
             PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
             OTEL_SDK_DISABLED: "true"
+            UNISON_CONVERSATION_DB_PATH: "/tmp/unison-context-tests.db"
         run: pytest -q --maxfail=1 --durations=15
