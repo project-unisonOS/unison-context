@@ -17,6 +17,13 @@ def reset_profile_store():
     os.environ["UNISON_ALLOWED_HOSTS"] = "testclient,localhost,127.0.0.1"
     fd, path = tempfile.mkstemp()
     os.close(fd)
+    # Ensure we start with a fresh connection for every test to avoid locked db
+    if server._DB_CONN:
+        try:
+            server._DB_CONN.close()
+        except Exception:
+            pass
+    server._DB_CONN = None
     server._DB_PATH = Path(path)
     server._init_db()
     yield
