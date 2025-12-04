@@ -7,7 +7,7 @@ Core service (active) â€” context/profile store used by orchestrator and re
 - Person profiles are stored in a local SQLite table (`person_profiles`) with `person_id` as the primary key.
 - Set `UNISON_CONTEXT_PROFILE_KEY` to a base64 url-safe Fernet key to encrypt/decrypt stored profiles. Without it, profiles are stored as JSON.
 - Enable `UNISON_REQUIRE_CONSENT=true` to require consent scopes on profile endpoints; access is further restricted to roles `admin|operator|service`.
-- Orchestrator skills such as `person.enroll`, `person.update_prefs`, and the startup prompt planner call the `/profile/{person_id}` APIs to read/write preferences (locale, dashboard, voice, payments, policy group, and similar fields).
+- Orchestrator skills such as `person.enroll`, `person.update_prefs`, and the startup prompt planner call the `/profile/{person_id}` APIs to read/write preferences (locale, dashboard, voice, payments, policy group, and similar fields). BCI profiles can be stored under a `bci` block (devices, control scheme, thresholds, decoder params, calibration/model pointers) with calibration artifacts kept in `unison-storage` vault.
 - Copy `.env.example` to `.env` and adjust hosts/keys for your setup.
 
 ### Testing
