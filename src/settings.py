@@ -34,6 +34,7 @@ class ContextServiceSettings:
     require_consent: bool = False
     conversation_db_path: str = "/tmp/unison-context-conversation.db"
     profile_enc_key: str = ""
+    database_url: str = ""
 
     @classmethod
     def from_env(cls) -> "ContextServiceSettings":
@@ -51,6 +52,7 @@ class ContextServiceSettings:
             require_consent=_as_bool(os.getenv("UNISON_REQUIRE_CONSENT", "false")),
             conversation_db_path=os.getenv("UNISON_CONTEXT_DB_PATH", "/tmp/unison-context-conversation.db"),
             profile_enc_key=os.getenv("UNISON_CONTEXT_PROFILE_KEY", ""),
+            database_url=os.getenv("UNISON_CONTEXT_DATABASE_URL", ""),
         )
 
 

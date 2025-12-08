@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from fastapi import FastAPI, Request, Body, Depends
 import uvicorn
 import logging
@@ -16,6 +18,8 @@ from unison_common.http_client import http_put_json_with_retry, http_get_json_wi
 from unison_common.consent import require_consent, ConsentScopes
 from unison_common.auth import require_roles
 from redaction import redact
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 try:
     from unison_common import BatonMiddleware
 except Exception:  # optional
@@ -51,10 +55,11 @@ instrument_httpx()
 _metrics = defaultdict(int)
 _start_time = time.time()
 _conversation_store: Dict[str, Dict[str, Any]] = {}
-_DB_CONN: sqlite3.Connection = None
+_ENGINE: Engine | None = None
 _DB_PATH: Path = Path(os.getenv("UNISON_CONVERSATION_DB_PATH", "/tmp/unison-context-conversation.db"))
 _PROFILE_KEY: Optional[bytes] = None
 _DASHBOARD_MAX = 100
+_DB_URL = os.getenv("UNISON_CONTEXT_DATABASE_URL")
 
 
 def load_settings() -> ContextServiceSettings:
@@ -69,6 +74,7 @@ def load_settings() -> ContextServiceSettings:
     globals()["REQUIRE_CONSENT"] = settings.require_consent
     globals()["_DB_PATH"] = Path(settings.conversation_db_path)
     globals()["_PROFILE_KEY"] = _load_profile_key(settings.profile_enc_key)
+    globals()["_DB_URL"] = settings.database_url or os.getenv("UNISON_CONTEXT_DATABASE_URL")
     return settings
 
 
@@ -84,11 +90,13 @@ def storage_get(key: str) -> Any:
 
 
 def _init_db():
-    """Initialize SQLite for conversation storage."""
-    global _DB_CONN
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _DB_CONN = sqlite3.connect(_DB_PATH, check_same_thread=False)
-    _DB_CONN.execute(
+    """Initialize storage backend (Postgres via SQLAlchemy or SQLite fallback)."""
+    global _ENGINE
+    db_url = _DB_URL or f"sqlite:///{_DB_PATH}"
+    if db_url.startswith("sqlite:///"):
+        Path(db_url.replace("sqlite:///", "")).parent.mkdir(parents=True, exist_ok=True)
+    _ENGINE = create_engine(db_url, future=True)
+    ddl_statements = [
         """
         CREATE TABLE IF NOT EXISTS conversation_sessions (
             person_id TEXT NOT NULL,
@@ -99,28 +107,25 @@ def _init_db():
             updated_at REAL,
             PRIMARY KEY (person_id, session_id)
         )
-        """
-    )
-    _DB_CONN.execute(
+        """,
         """
         CREATE TABLE IF NOT EXISTS person_profiles (
             person_id TEXT PRIMARY KEY,
             profile_json TEXT,
             updated_at REAL
         )
-        """
-    )
-    _DB_CONN.execute(
+        """,
         """
         CREATE TABLE IF NOT EXISTS dashboard_state (
             person_id TEXT PRIMARY KEY,
             state_json TEXT,
             updated_at REAL
         )
-        """
-    )
-    _DB_CONN.execute("PRAGMA journal_mode=WAL;")
-    _DB_CONN.commit()
+        """,
+    ]
+    with _ENGINE.begin() as conn:
+        for ddl in ddl_statements:
+            conn.execute(text(ddl))
 
 
 def _load_profile_key(raw: str) -> Optional[bytes]:
@@ -265,10 +270,12 @@ def dashboard_get(
     if not isinstance(person_id, str) or not person_id:
         return {"ok": False, "error": "invalid-person-id"}
     try:
-        row = _DB_CONN.execute(
-            "SELECT state_json, updated_at FROM dashboard_state WHERE person_id=?", (person_id,)
-        ).fetchone()
-        if not row:
+        with _ENGINE.begin() as conn:
+            row = conn.execute(
+                text("SELECT state_json, updated_at FROM dashboard_state WHERE person_id=:pid"),
+                {"pid": person_id},
+            ).fetchone()
+        if not row or not row[0]:
             return {"ok": True, "dashboard": None}
         state_json, updated_at = row
         state = _decrypt_dashboard(state_json) if state_json else {}
@@ -308,11 +315,19 @@ def dashboard_put(
         dashboard.setdefault("person_id", person_id)
         dashboard.setdefault("updated_at", time.time())
         state_json = _encrypt_dashboard(dashboard)
-        _DB_CONN.execute(
-            "REPLACE INTO dashboard_state (person_id, state_json, updated_at) VALUES (?, ?, ?)",
-            (person_id, state_json, time.time()),
-        )
-        _DB_CONN.commit()
+        with _ENGINE.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO dashboard_state (person_id, state_json, updated_at)
+                    VALUES (:pid, :state_json, :updated_at)
+                    ON CONFLICT (person_id) DO UPDATE SET
+                        state_json=excluded.state_json,
+                        updated_at=excluded.updated_at
+                    """
+                ),
+                {"pid": person_id, "state_json": state_json, "updated_at": time.time()},
+            )
         return {"ok": True, "person_id": person_id}
     except Exception as exc:
         log_json(logging.WARNING, "dashboard_put_error", service="unison-context", error=str(exc))
@@ -373,8 +388,9 @@ def ready(request: Request):
 @conv_router.get("/conversation/health")
 def conversation_health():
     try:
-        _DB_CONN.execute("SELECT 1")
-        return {"ok": True, "db_path": str(_DB_PATH)}
+        with _ENGINE.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"ok": True, "db_url": _DB_URL or f"sqlite:///{_DB_PATH}"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -396,18 +412,28 @@ def conversation_store(person_id: str, session_id: str, body: Dict[str, Any] = B
     }
     # Persist to SQLite
     try:
-        _DB_CONN.execute(
-            "REPLACE INTO conversation_sessions (person_id, session_id, messages_json, response_json, summary, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                person_id,
-                session_id,
-                json.dumps(messages),
-                json.dumps(response),
-                summary,
-                time.time(),
-            ),
-        )
-        _DB_CONN.commit()
+        with _ENGINE.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO conversation_sessions (person_id, session_id, messages_json, response_json, summary, updated_at)
+                    VALUES (:pid, :sid, :msg, :resp, :summary, :updated_at)
+                    ON CONFLICT (person_id, session_id) DO UPDATE SET
+                        messages_json=excluded.messages_json,
+                        response_json=excluded.response_json,
+                        summary=excluded.summary,
+                        updated_at=excluded.updated_at
+                    """
+                ),
+                {
+                    "pid": person_id,
+                    "sid": session_id,
+                    "msg": json.dumps(messages),
+                    "resp": json.dumps(response),
+                    "summary": summary,
+                    "updated_at": time.time(),
+                },
+            )
     except Exception as exc:
         log_json(logging.WARNING, "conversation_store_db_error", service="unison-context", error=str(exc))
     return {"ok": True, "event_id": key}
@@ -419,10 +445,16 @@ def conversation_load(person_id: str, session_id: str):
     if key in _conversation_store:
         return _conversation_store[key]
     try:
-        row = _DB_CONN.execute(
-            "SELECT messages_json, response_json, summary, updated_at FROM conversation_sessions WHERE person_id=? AND session_id=?",
-            (person_id, session_id),
-        ).fetchone()
+        with _ENGINE.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT messages_json, response_json, summary, updated_at
+                    FROM conversation_sessions WHERE person_id=:pid AND session_id=:sid
+                    """
+                ),
+                {"pid": person_id, "sid": session_id},
+            ).fetchone()
         if row:
             messages_json, response_json, summary, updated_at = row
             stored = {
@@ -450,9 +482,11 @@ def profile_get(
     if not isinstance(person_id, str) or not person_id:
         return {"ok": False, "error": "invalid-person-id"}
     try:
-        row = _DB_CONN.execute(
-            "SELECT profile_json, updated_at FROM person_profiles WHERE person_id=?", (person_id,)
-        ).fetchone()
+        with _ENGINE.begin() as conn:
+            row = conn.execute(
+                text("SELECT profile_json, updated_at FROM person_profiles WHERE person_id=:pid"),
+                {"pid": person_id},
+            ).fetchone()
         if not row:
             return {"ok": True, "profile": None}
         profile_json, updated_at = row
@@ -489,11 +523,19 @@ def profile_put(
         profile["unison_id"] = person_id
     try:
         stored = _encrypt_profile(profile)
-        _DB_CONN.execute(
-            "REPLACE INTO person_profiles (person_id, profile_json, updated_at) VALUES (?, ?, ?)",
-            (person_id, stored, time.time()),
-        )
-        _DB_CONN.commit()
+        with _ENGINE.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO person_profiles (person_id, profile_json, updated_at)
+                    VALUES (:pid, :profile_json, :updated_at)
+                    ON CONFLICT (person_id) DO UPDATE SET
+                        profile_json=excluded.profile_json,
+                        updated_at=excluded.updated_at
+                    """
+                ),
+                {"pid": person_id, "profile_json": stored, "updated_at": time.time()},
+            )
         return {"ok": True, "person_id": person_id}
     except Exception as exc:
         log_json(logging.WARNING, "profile_put_error", service="unison-context", error=str(exc))
