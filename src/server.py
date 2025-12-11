@@ -17,6 +17,7 @@ from unison_common.tracing import initialize_tracing, instrument_fastapi, instru
 from unison_common.http_client import http_put_json_with_retry, http_get_json_with_retry
 from unison_common.consent import require_consent, ConsentScopes
 from unison_common.auth import require_roles
+from unison_common.audit_middleware import AuditMiddleware
 from redaction import redact
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -37,6 +38,8 @@ app = FastAPI(title="unison-context")
 app.add_middleware(TracingMiddleware, service_name="unison-context")
 if BatonMiddleware:
     app.add_middleware(BatonMiddleware)
+# Audit logging with redacted headers
+app.add_middleware(AuditMiddleware, service_name="unison-context")
 
 _KV_STORE: Dict[str, Any] = {}
 # Routers are declared up-front so they can be referenced by later route decorators.
