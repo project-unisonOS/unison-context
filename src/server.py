@@ -93,6 +93,8 @@ def _init_db():
     """Initialize storage backend (Postgres via SQLAlchemy or SQLite fallback)."""
     global _ENGINE
     db_url = _DB_URL or f"sqlite:///{_DB_PATH}"
+    if os.getenv("ENVIRONMENT") == "prod" and db_url.startswith("sqlite"):
+        raise RuntimeError("SQLite is not allowed in production; set UNISON_CONTEXT_DATABASE_URL to Postgres")
     if db_url.startswith("sqlite:///"):
         Path(db_url.replace("sqlite:///", "")).parent.mkdir(parents=True, exist_ok=True)
     _ENGINE = create_engine(db_url, future=True)
