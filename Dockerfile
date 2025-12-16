@@ -1,6 +1,6 @@
 # For meta-repo builds; pins base image
 FROM ghcr.io/project-unisonos/unison-common-wheel:latest AS common_wheel
-FROM python:3.12-slim@sha256:fdab368dc2e04fab3180d04508b41732756cc442586f708021560ee1341f3d29
+FROM python:3.14-slim@sha256:2751cbe93751f0147bc1584be957c6dd4c5f977c3d4e0396b56456a9fd4ed137
 
 ARG REPO_PATH="."
 WORKDIR /app
