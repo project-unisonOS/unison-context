@@ -4,9 +4,19 @@ FROM python:3.12-slim@sha256:fdab368dc2e04fab3180d04508b41732756cc442586f7080215
 
 ARG REPO_PATH="."
 WORKDIR /app
-COPY --from=common_wheel /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=common_wheel /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ${REPO_PATH}/constraints.txt ./constraints.txt
+COPY ${REPO_PATH}/requirements.txt ./requirements.txt
+COPY --from=common_wheel /tmp/wheels /tmp/wheels
+RUN pip install --no-cache-dir -c ./constraints.txt /tmp/wheels/unison_common-*.whl \
+    && pip install --no-cache-dir -c ./constraints.txt -r requirements.txt
+
+COPY ${REPO_PATH}/src ./src
+COPY ${REPO_PATH}/tests ./tests
+
+ENV PYTHONPATH=/app/src
+EXPOSE 8081
 CMD ["python", "src/server.py"]
