@@ -1,46 +1,58 @@
 # unison-context
 
+Context, profile, dashboard, and conversation store for UnisonOS.
+
 ## Status
-Core service (active) â€” context/profile store used by orchestrator and renderer; exposed on `8081` in devstack.
+Core service (active). The current implementation is a FastAPI service in `src/server.py` with local SQLite-backed profile and conversation storage plus best-effort key/value passthrough to `unison-storage`.
 
-### Profiles and secure storage
-- Person profiles are stored in a local SQLite table (`person_profiles`) with `person_id` as the primary key.
-- Set `UNISON_CONTEXT_PROFILE_KEY` to a base64 url-safe Fernet key to encrypt/decrypt stored profiles. Without it, profiles are stored as JSON.
-- Enable `UNISON_REQUIRE_CONSENT=true` to require consent scopes on profile endpoints; access is further restricted to roles `admin|operator|service`.
-- Orchestrator skills such as `person.enroll`, `person.update_prefs`, and the startup prompt planner call the `/profile/{person_id}` APIs to read/write preferences (locale, dashboard, voice, payments, policy group, and similar fields). BCI profiles can be stored under a `bci` block (devices, control scheme, thresholds, decoder params, calibration/model pointers) with calibration artifacts kept in `unison-storage` vault.
-- Copy `.env.example` to `.env` and adjust hosts/keys for your setup.
+## What is implemented
+- Conversation history endpoints for per-person, per-session companion state.
+- Profile read/write endpoints with optional Fernet encryption via `UNISON_CONTEXT_PROFILE_KEY`.
+- Dashboard read/write endpoints for persisted cards and layout preferences.
+- Key/value helpers backed by `unison-storage`.
+- Health, readiness, and Prometheus-style metrics endpoints.
+- Optional policy-group validation and consent enforcement controlled from `src/settings.py`.
 
-### Testing
-- Create venv and install deps: `python3 -m venv .venv && . .venv/bin/activate && pip install -c ../constraints.txt -r requirements.txt`
-- Run tests (with plugins disabled): `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OTEL_SDK_DISABLED=true python -m pytest -p no:capture -p no:logging tests`
+## API surface
+- `GET /health`, `GET /healthz`
+- `GET /ready`, `GET /readyz`
+- `GET /metrics`
+- `GET /conversation/health`
+- `POST /conversation/{person_id}/{session_id}`
+- `GET /conversation/{person_id}/{session_id}`
+- `GET /profile/{person_id}`
+- `POST /profile/{person_id}`
+- `POST /profile.export`
+- `GET /dashboard/{person_id}`
+- `POST /dashboard/{person_id}`
+- `POST /kv/put`
+- `POST /kv/set`
+- `POST /kv/get`
 
-### Quickstart
+## Run locally
 ```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -c ../constraints.txt -r requirements.txt
 cp .env.example .env
-python src/context_service.py
+python src/server.py
 ```
 
-### Key Endpoints (sample)
-- `GET /health` and `GET /ready` â€” service status
-- `GET /profile/{person_id}` â€” fetch profile
-- `POST /profile/{person_id}` â€” write profile (honors `UNISON_REQUIRE_CONSENT` and role checks)
-- `POST /kv/put` â€” store arbitrary key/value pairs
-- `POST /kv/get` â€” retrieve stored values
-- `GET /dashboard/{person_id}` â€” fetch per-person dashboard state (cards + preferences)
-- `POST /dashboard/{person_id}` â€” store per-person dashboard state (encrypted when profile key is configured)
+## Key configuration
+- `UNISON_STORAGE_HOST`, `UNISON_STORAGE_PORT`
+- `UNISON_POLICY_HOST`, `UNISON_POLICY_PORT`
+- `UNISON_POLICY_VALIDATE_GROUPS`
+- `UNISON_REQUIRE_CONSENT`
+- `UNISON_CONTEXT_DB_PATH`
+- `UNISON_CONTEXT_DATABASE_URL`
+- `UNISON_CONTEXT_PROFILE_KEY`
 
+## Tests
 ```bash
-curl -X POST http://localhost:8081/profile/person-123 \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"profile": {"name": "Alex", "locale": "en-US", "dashboard": {"theme": "high-contrast"}}}'
-
-curl -X POST http://localhost:8081/dashboard/person-123 \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"dashboard": {"cards": [{"id": "card-1", "type": "summary", "title": "Morning briefing", "body": "3 meetings today."}], "preferences": {"layout": "comms-first"}}}'
+python3 -m venv .venv && . .venv/bin/activate
+pip install -c ../constraints.txt -r requirements.txt
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OTEL_SDK_DISABLED=true python -m pytest tests
 ```
 
 ## Docs
-
-Full docs at https://project-unisonos.github.io
+- Public docs: https://project-unisonos.github.io
+- Repo docs: `SETUP.md`, `SECURITY.md`
