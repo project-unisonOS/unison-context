@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, text
 
 from governed_repository import AmbiguousContext, ContextAccessDenied, GovernedContextRepository
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
+from unison_common.household import HouseholdCoordinationRequest
 
 
 @pytest.fixture
@@ -53,7 +54,10 @@ def test_relationships_do_not_grant_access_and_overlapping_contact_prompts(repo)
 
 def test_explicit_share_clones_without_reclassifying_private_source(repo):
     alice, _ = _people(repo)
-    shared = repo.create_space("alice", name="Household groceries", purpose="coordinate groceries")
+    shared = repo.create_space(
+        "alice", household_id="household-one",
+        name="Household groceries", purpose="coordinate groceries"
+    )
     repo.invite_member("alice", shared.space_id, "bob", MemberRole.EDITOR)
     repo.accept_invitation("bob", shared.space_id)
     private = repo.admit_memory(
@@ -70,7 +74,9 @@ def test_explicit_share_clones_without_reclassifying_private_source(repo):
 
 def test_member_removal_rotates_space_key_and_revokes_all_artifacts(repo):
     _people(repo)
-    shared = repo.create_space("alice", name="Family", purpose="shared planning")
+    shared = repo.create_space(
+        "alice", household_id="household-one", name="Family", purpose="shared planning"
+    )
     repo.invite_member("alice", shared.space_id, "bob", MemberRole.EDITOR)
     repo.accept_invitation("bob", shared.space_id)
     for kind in (MemoryKind.CALENDAR_EVENT, MemoryKind.SUMMARY, MemoryKind.DERIVED_INDEX):
@@ -79,6 +85,56 @@ def test_member_removal_rotates_space_key_and_revokes_all_artifacts(repo):
     assert repo.remove_member("alice", shared.space_id, "bob") == 2
     with pytest.raises(ContextAccessDenied):
         repo.search("bob", space_ids=[shared.space_id])
+
+
+def test_household_coordination_uses_only_shared_calendar_and_grocery_facts(repo):
+    alice, _ = _people(repo)
+    private = repo.admit_memory(
+        "alice", space_id=alice.space_id, kind=MemoryKind.ASSERTED_FACT,
+        content={"surprise": "private birthday plan"}, provenance="alice",
+    )
+    shared = repo.create_space(
+        "alice", household_id="household-one", name="Household", purpose="coordinate"
+    )
+    repo.invite_member("alice", shared.space_id, "bob", MemberRole.EDITOR)
+    repo.accept_invitation("bob", shared.space_id)
+    created = repo.coordinate_household_artifact(
+        "alice",
+        HouseholdCoordinationRequest(
+            household_id="household-one", space_id=shared.space_id,
+            action="create", purpose="buy breakfast",
+            artifact_kind="grocery_item", grocery={"item": "oats", "quantity": "1 bag"},
+        ),
+    )
+    listed = repo.coordinate_household_artifact(
+        "bob",
+        HouseholdCoordinationRequest(
+            household_id="household-one", space_id=shared.space_id,
+            action="list", purpose="review household list",
+        ),
+    )
+    assert created.private_sources_read == 0
+    assert [item.content["item"] for item in listed.artifacts] == ["oats"]
+    assert "birthday" not in str(listed.model_dump())
+    assert repo.get_memory("alice", private.record_id).content["surprise"] == "private birthday plan"
+
+
+def test_share_preview_and_audit_avoid_private_values(repo):
+    alice, _ = _people(repo)
+    shared = repo.create_space(
+        "alice", household_id="household-one", name="Household", purpose="coordinate"
+    )
+    repo.invite_member("alice", shared.space_id, "bob", MemberRole.EDITOR)
+    repo.accept_invitation("bob", shared.space_id)
+    private = repo.admit_memory(
+        "alice", space_id=alice.space_id, kind=MemoryKind.ASSERTED_FACT,
+        content={"title": "private", "detail": "not in preview"}, provenance="alice",
+    )
+    preview = repo.preview_share("alice", private.record_id, shared.space_id, "coordinate")
+    assert preview.source_remains_private is True
+    assert preview.fields_to_share == ("detail", "title")
+    assert "not in preview" not in str(preview.model_dump())
+    assert repo.list_audit_events("bob", shared.space_id)
 
 
 def test_retention_deletion_inspection_and_export_reconcile(repo):

@@ -14,7 +14,10 @@ def test_governed_api_explicit_share_and_non_oracular_denial(tmp_path, monkeypat
     client.post("/v2/spaces/private", json={"person_id": "bob"}).raise_for_status()
     shared = client.post(
         "/v2/spaces",
-        json={"person_id": "alice", "name": "Household", "purpose": "groceries"},
+        json={
+            "person_id": "alice", "household_id": "household-one",
+            "name": "Household", "purpose": "groceries",
+        },
     ).json()["space"]
     invitation = client.post(
         f"/v2/spaces/{shared['space_id']}/invitations",
