@@ -18,6 +18,13 @@ from unison_common.http_client import http_put_json_with_retry, http_get_json_wi
 from unison_common.consent import require_consent, ConsentScopes
 from unison_common.auth import require_roles
 from unison_common.audit_middleware import AuditMiddleware
+from unison_common.principal_middleware import (
+    PrincipalBindingMiddleware,
+    get_bound_principal,
+    get_current_principal,
+    get_current_principal_token,
+)
+from unison_common.trust import LocalDevelopmentKeyBroker
 from redaction import redact
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -40,6 +47,17 @@ if BatonMiddleware:
     app.add_middleware(BatonMiddleware)
 # Audit logging with redacted headers
 app.add_middleware(AuditMiddleware, service_name="unison-context")
+app.add_middleware(
+    PrincipalBindingMiddleware,
+    service_name="context",
+    public_paths={"/", "/health", "/healthz", "/ready", "/readyz", "/metrics", "/conversation/health", "/docs", "/openapi.json"},
+    path_identity_patterns={
+        r"/profile/(?P<person_id>[^/]+)": "person_id",
+        r"/dashboard/(?P<person_id>[^/]+)": "person_id",
+        r"/conversation/(?P<person_id>[^/]+)/[^/]+": "person_id",
+    },
+    allow_test_bypass=True,
+)
 
 _KV_STORE: Dict[str, Any] = {}
 # Routers are declared up-front so they can be referenced by later route decorators.
@@ -61,6 +79,7 @@ _conversation_store: Dict[str, Dict[str, Any]] = {}
 _ENGINE: Engine | None = None
 _DB_PATH: Path = Path(os.getenv("UNISON_CONVERSATION_DB_PATH", "/tmp/unison-context-conversation.db"))
 _PROFILE_KEY: Optional[bytes] = None
+_KEY_BROKER: Optional[LocalDevelopmentKeyBroker] = None
 _DASHBOARD_MAX = 100
 _DB_URL = os.getenv("UNISON_CONTEXT_DATABASE_URL")
 
@@ -77,19 +96,34 @@ def load_settings() -> ContextServiceSettings:
     globals()["REQUIRE_CONSENT"] = settings.require_consent
     globals()["_DB_PATH"] = Path(settings.conversation_db_path)
     globals()["_PROFILE_KEY"] = _load_profile_key(settings.profile_enc_key)
+    globals()["_KEY_BROKER"] = LocalDevelopmentKeyBroker(globals()["_PROFILE_KEY"]) if globals()["_PROFILE_KEY"] else None
     globals()["_DB_URL"] = settings.database_url or os.getenv("UNISON_CONTEXT_DATABASE_URL")
     return settings
 
 
 def storage_put(key: str, value: Any) -> bool:
-    ok, _, _ = http_put_json_with_retry(STORAGE_HOST, STORAGE_PORT, f"/kv/context/{quote(key, safe='')}", {"value": value}, max_retries=3, base_delay=0.1, max_delay=2.0, timeout=2.0)
+    token = get_current_principal_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    ok, _, _ = http_put_json_with_retry(STORAGE_HOST, STORAGE_PORT, f"/kv/context/{quote(key, safe='')}", {"value": value}, headers=headers, max_retries=3, base_delay=0.1, max_delay=2.0, timeout=2.0)
     return ok
 
 def storage_get(key: str) -> Any:
-    ok, _, body = http_get_json_with_retry(STORAGE_HOST, STORAGE_PORT, f"/kv/context/{quote(key, safe='')}", max_retries=3, base_delay=0.1, max_delay=2.0, timeout=2.0)
+    token = get_current_principal_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    ok, _, body = http_get_json_with_retry(STORAGE_HOST, STORAGE_PORT, f"/kv/context/{quote(key, safe='')}", headers=headers, max_retries=3, base_delay=0.1, max_delay=2.0, timeout=2.0)
     if not ok or not isinstance(body, dict):
         return None
     return body.get("value")
+
+
+def _cache_key(key: str) -> str:
+    principal = get_current_principal()
+    return f"{principal.cache_namespace}:{key}" if principal else key
+
+
+def _index_key(key: str) -> str:
+    principal = get_current_principal()
+    return f"{principal.index_namespace}:{key}" if principal else key
 
 
 def _init_db():
@@ -137,59 +171,66 @@ def _load_profile_key(raw: str) -> Optional[bytes]:
     if not raw:
         return None
     try:
-        return urlsafe_b64decode(raw)
+        decoded = urlsafe_b64decode(raw)
+        return decoded if len(decoded) >= 32 else None
     except Exception:
         return None
 
 
 def _encrypt_profile(profile: Dict[str, Any]) -> str:
-    if not _PROFILE_KEY:
+    principal = get_current_principal()
+    if not _KEY_BROKER or not principal or not principal.key_handle:
+        if os.getenv("ENVIRONMENT") == "prod":
+            raise RuntimeError("principal key broker is required for profile encryption")
         return json.dumps(profile)
-    try:
-        from cryptography.fernet import Fernet
-
-        f = Fernet(_PROFILE_KEY)
-        return f.encrypt(json.dumps(profile).encode("utf-8")).decode("utf-8")
-    except Exception:
-        return json.dumps(profile)
+    encrypted = _KEY_BROKER.encrypt(
+        key_handle=principal.key_handle,
+        plaintext=json.dumps(profile).encode("utf-8"),
+        associated_data=b"unison-context:profile",
+    )
+    return "p1:" + encrypted.decode("utf-8")
 
 
 def _decrypt_profile(ciphertext: str) -> Dict[str, Any]:
-    if not _PROFILE_KEY:
+    if not ciphertext.startswith("p1:"):
         return json.loads(ciphertext) if ciphertext else {}
-    try:
-        from cryptography.fernet import Fernet
-
-        f = Fernet(_PROFILE_KEY)
-        plaintext = f.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
-        return json.loads(plaintext)
-    except Exception:
-        return json.loads(ciphertext) if ciphertext else {}
+    principal = get_current_principal()
+    if not _KEY_BROKER or not principal or not principal.key_handle:
+        raise RuntimeError("principal key broker is unavailable")
+    plaintext = _KEY_BROKER.decrypt(
+        key_handle=principal.key_handle,
+        ciphertext=ciphertext[3:].encode("utf-8"),
+        associated_data=b"unison-context:profile",
+    )
+    return json.loads(plaintext.decode("utf-8"))
 
 
 def _encrypt_dashboard(state: Dict[str, Any]) -> str:
-    if not _PROFILE_KEY:
+    principal = get_current_principal()
+    if not _KEY_BROKER or not principal or not principal.key_handle:
+        if os.getenv("ENVIRONMENT") == "prod":
+            raise RuntimeError("principal key broker is required for dashboard encryption")
         return json.dumps(state)
-    try:
-        from cryptography.fernet import Fernet
-
-        f = Fernet(_PROFILE_KEY)
-        return f.encrypt(json.dumps(state).encode("utf-8")).decode("utf-8")
-    except Exception:
-        return json.dumps(state)
+    encrypted = _KEY_BROKER.encrypt(
+        key_handle=principal.key_handle,
+        plaintext=json.dumps(state).encode("utf-8"),
+        associated_data=b"unison-context:dashboard",
+    )
+    return "p1:" + encrypted.decode("utf-8")
 
 
 def _decrypt_dashboard(ciphertext: str) -> Dict[str, Any]:
-    if not _PROFILE_KEY:
+    if not ciphertext.startswith("p1:"):
         return json.loads(ciphertext) if ciphertext else {}
-    try:
-        from cryptography.fernet import Fernet
-
-        f = Fernet(_PROFILE_KEY)
-        plaintext = f.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
-        return json.loads(plaintext)
-    except Exception:
-        return json.loads(ciphertext) if ciphertext else {}
+    principal = get_current_principal()
+    if not _KEY_BROKER or not principal or not principal.key_handle:
+        raise RuntimeError("principal key broker is unavailable")
+    plaintext = _KEY_BROKER.decrypt(
+        key_handle=principal.key_handle,
+        ciphertext=ciphertext[3:].encode("utf-8"),
+        associated_data=b"unison-context:dashboard",
+    )
+    return json.loads(plaintext.decode("utf-8"))
 
 
 # Initialize settings after helpers are defined
@@ -256,10 +297,14 @@ def _authorize(headers: Dict[str, Any]):
     return False
 
 
-def _role_guard(x_test_role: Optional[str] = Header(default=None)):
-    if _authorize({"x-test-role": x_test_role}):
+def _role_guard(request: Request, x_test_role: Optional[str] = Header(default=None)):
+    try:
+        context = get_bound_principal(request)
+        return {"roles": list(context.roles), "person_id": context.person_id, "principal_id": context.principal_id}
+    except RuntimeError:
+        pass
+    if os.getenv("UNISON_PRINCIPAL_BINDING_TEST_BYPASS", "false").lower() == "true" and _authorize({"x-test-role": x_test_role}):
         return {"roles": [x_test_role]}
-    # In production, this should be replaced by proper auth; here we return None to trigger 401
     from fastapi import HTTPException
 
     raise HTTPException(status_code=401, detail="unauthorized")
@@ -562,11 +607,11 @@ def profile_export(request: Request, body: Dict[str, Any] = Body(...)):
     person_id = body.get("person_id")
     if not isinstance(person_id, str) or person_id == "":
         return {"ok": False, "error": "invalid-person_id", "event_id": event_id}
-    prefix = f"{person_id}:"
+    prefix = _cache_key(f"{person_id}:")
     items: Dict[str, Any] = {}
     for k, v in list(_KV_STORE.items()):
         if isinstance(k, str) and k.startswith(prefix) and ":profile:" in k:
-            items[k] = v
+            items[k.removeprefix(f"{get_current_principal().cache_namespace}:") if get_current_principal() else k] = v
     log_json(logging.INFO, "profile_export", service="unison-context", event_id=event_id, person_id=person_id, count=len(items))
     return {
         "ok": True,
@@ -608,13 +653,13 @@ def kv_put(
     # Persist to storage (best-effort) and update in-memory cache
     storage_ok = True
     for k, v in items.items():
-        _KV_STORE[k] = v
+        _KV_STORE[_cache_key(k)] = v
         if not storage_put(k, v):
             storage_ok = False
 
     # Maintain a Tier B index for export: index:{person_id}:profile -> [keys]
     if tier == "B":
-        idx_key = f"index:{person_id}:profile"
+        idx_key = _index_key(f"index:{person_id}:profile")
         existing = storage_get(idx_key)
         if not isinstance(existing, list):
             existing = []
@@ -638,7 +683,7 @@ def kv_set(
     value = body.get("value")
     if not isinstance(key, str) or key == "":
         return {"ok": False, "error": "invalid-key", "event_id": event_id}
-    _KV_STORE[key] = value
+    _KV_STORE[_cache_key(key)] = value
     log_json(logging.INFO, "kv_set", service="unison-context", event_id=event_id, key=key)
     return {"ok": True, "event_id": event_id}
 
@@ -657,8 +702,9 @@ def kv_get(
     result: Dict[str, Any] = {}
     for k in keys:
         val = storage_get(k)
-        if val is None and k in _KV_STORE:
-            val = _KV_STORE.get(k)
+        partitioned = _cache_key(k)
+        if val is None and partitioned in _KV_STORE:
+            val = _KV_STORE.get(partitioned)
         result[k] = val
     log_json(logging.INFO, "kv_get", service="unison-context", event_id=event_id, keys=len(keys))
     return {"ok": True, "values": result, "event_id": event_id}

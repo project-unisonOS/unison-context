@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from unison_common.trust import read_secret_setting
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -51,7 +52,7 @@ class ContextServiceSettings:
             ),
             require_consent=_as_bool(os.getenv("UNISON_REQUIRE_CONSENT", "false")),
             conversation_db_path=os.getenv("UNISON_CONTEXT_DB_PATH", "/tmp/unison-context-conversation.db"),
-            profile_enc_key=os.getenv("UNISON_CONTEXT_PROFILE_KEY", ""),
+            profile_enc_key=read_secret_setting("UNISON_CONTEXT_PROFILE_KEY"),
             database_url=os.getenv("UNISON_CONTEXT_DATABASE_URL", ""),
         )
 
