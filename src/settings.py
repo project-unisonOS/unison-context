@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from unison_common.trust import read_secret_setting
+
+
+DEFAULT_CONTEXT_DB_PATH = str(Path.home() / ".local" / "state" / "unison" / "context.db")
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -33,7 +37,7 @@ class ContextServiceSettings:
     storage: StorageSettings = field(default_factory=StorageSettings)
     policy: PolicySettings = field(default_factory=PolicySettings)
     require_consent: bool = False
-    conversation_db_path: str = "/tmp/unison-context-conversation.db"
+    conversation_db_path: str = DEFAULT_CONTEXT_DB_PATH
     profile_enc_key: str = ""
     database_url: str = ""
 
@@ -51,7 +55,7 @@ class ContextServiceSettings:
                 enable_validation=_as_bool(os.getenv("UNISON_POLICY_VALIDATE_GROUPS"), False),
             ),
             require_consent=_as_bool(os.getenv("UNISON_REQUIRE_CONSENT", "false")),
-            conversation_db_path=os.getenv("UNISON_CONTEXT_DB_PATH", "/tmp/unison-context-conversation.db"),
+            conversation_db_path=os.getenv("UNISON_CONTEXT_DB_PATH", DEFAULT_CONTEXT_DB_PATH),
             profile_enc_key=read_secret_setting("UNISON_CONTEXT_PROFILE_KEY"),
             database_url=os.getenv("UNISON_CONTEXT_DATABASE_URL", ""),
         )
