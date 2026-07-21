@@ -1,5 +1,11 @@
-# For meta-repo builds; pins base image
-FROM ghcr.io/project-unisonos/unison-common-wheel:latest AS common_wheel
+FROM python:3.12-slim@sha256:fdab368dc2e04fab3180d04508b41732756cc442586f708021560ee1341f3d29 AS common_wheel
+
+ARG UNISON_COMMON_REF="5337e80894bb2430341e3210e2821c8dd8ca643e"
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip wheel --no-cache-dir --no-deps --wheel-dir /tmp/wheels \
+       "git+https://github.com/project-unisonOS/unison-common.git@${UNISON_COMMON_REF}"
+
 FROM python:3.12-slim@sha256:fdab368dc2e04fab3180d04508b41732756cc442586f708021560ee1341f3d29
 
 ARG REPO_PATH="."
