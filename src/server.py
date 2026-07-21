@@ -40,6 +40,7 @@ from fastapi import APIRouter
 from settings import DEFAULT_CONTEXT_DB_PATH, ContextServiceSettings
 from governed_repository import AmbiguousContext, GovernedContextRepository
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
+from unison_common.household import HouseholdCoordinationRequest
 
 app = FastAPI(title="unison-context")
 app.add_middleware(TracingMiddleware, service_name="unison-context")
@@ -765,9 +766,43 @@ def governed_create_space(request: Request, body: Dict[str, Any] = Body(...)):
         space = _repo().create_space(
             actor, name=str(body.get("name") or "").strip(),
             purpose=str(body.get("purpose") or "").strip(),
+            household_id=str(body.get("household_id") or "").strip() or None,
             kind=SpaceKind(str(body.get("kind") or "shared")),
         )
         return {"space": space.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/household/coordinate")
+def governed_household_coordinate(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        outcome = _repo().coordinate_household_artifact(
+            actor, HouseholdCoordinationRequest.model_validate(body)
+        )
+        return outcome.model_dump(mode="json")
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/{record_id}/share-preview")
+def governed_share_preview(record_id: str, request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        preview = _repo().preview_share(
+            actor, record_id, str(body["target_space_id"]), str(body.get("purpose") or "share")
+        )
+        return {"preview": preview.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.get("/v2/audit")
+def governed_audit(request: Request, space_id: str | None = None, person_id: str | None = None):
+    actor, _ = _governed_actor(request, person_id)
+    try:
+        return {"events": _repo().list_audit_events(actor, space_id)}
     except Exception as exc:
         raise _context_error(exc) from exc
 

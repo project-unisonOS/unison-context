@@ -23,6 +23,16 @@ from unison_common.governed_context import (
     SpaceKind,
     SpaceMembership,
 )
+from unison_common.household import (
+    CoordinationAction,
+    CoordinationStatus,
+    HouseholdArtifact,
+    HouseholdArtifactKind,
+    HouseholdCoordinationOutcome,
+    HouseholdCoordinationRequest,
+    SharePreview,
+    SharedFact,
+)
 
 
 class ContextAccessDenied(RuntimeError):
@@ -56,7 +66,7 @@ class GovernedContextRepository:
         statements = [
             """CREATE TABLE IF NOT EXISTS context_spaces (
                 space_id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner_person_id TEXT NOT NULL,
-                assistant_instance_id TEXT, name TEXT NOT NULL, purpose TEXT NOT NULL,
+                household_id TEXT, assistant_instance_id TEXT, name TEXT NOT NULL, purpose TEXT NOT NULL,
                 key_handle TEXT NOT NULL, key_version INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL, deleted_at TEXT
             )""",
@@ -123,6 +133,10 @@ class GovernedContextRepository:
         with self.engine.begin() as conn:
             for statement in statements:
                 conn.execute(text(statement))
+        columns = {column["name"] for column in inspect(self.engine).get_columns("context_spaces")}
+        if "household_id" not in columns:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE context_spaces ADD COLUMN household_id TEXT"))
 
     def _audit(
         self,
@@ -167,13 +181,14 @@ class GovernedContextRepository:
 
     def create_space(
         self, owner_person_id: str, *, name: str, purpose: str,
-        kind: SpaceKind = SpaceKind.SHARED,
+        household_id: str | None = None, kind: SpaceKind = SpaceKind.SHARED,
     ) -> ContextSpace:
         if kind is SpaceKind.PRIVATE:
             raise ValueError("use ensure_private_space for private spaces")
         space = ContextSpace(
             space_id=str(uuid4()), kind=kind, owner_person_id=owner_person_id,
-            name=name, purpose=purpose, key_handle=f"space-key:{uuid4()}",
+            household_id=household_id, name=name, purpose=purpose,
+            key_handle=f"space-key:{uuid4()}",
         )
         self._insert_space(space, owner_state="active")
         self._audit(owner_person_id, "space.created", purpose, space_id=space.space_id)
@@ -186,12 +201,13 @@ class GovernedContextRepository:
         )
         with self.engine.begin() as conn:
             conn.execute(text("""INSERT INTO context_spaces
-                (space_id, kind, owner_person_id, assistant_instance_id, name, purpose,
+                (space_id, kind, owner_person_id, household_id, assistant_instance_id, name, purpose,
                  key_handle, key_version, created_at, deleted_at)
-                VALUES (:space_id, :kind, :owner, :assistant, :name, :purpose,
+                VALUES (:space_id, :kind, :owner, :household, :assistant, :name, :purpose,
                         :key, :key_version, :created, NULL)"""), {
                 "space_id": space.space_id, "kind": space.kind.value,
-                "owner": space.owner_person_id, "assistant": space.assistant_instance_id,
+                "owner": space.owner_person_id, "household": space.household_id,
+                "assistant": space.assistant_instance_id,
                 "name": space.name, "purpose": space.purpose, "key": space.key_handle,
                 "key_version": space.key_version, "created": space.created_at.isoformat(),
             })
@@ -211,6 +227,7 @@ class GovernedContextRepository:
             raise KeyError("space not found")
         return ContextSpace(
             space_id=row["space_id"], kind=row["kind"], owner_person_id=row["owner_person_id"],
+            household_id=row["household_id"],
             assistant_instance_id=row["assistant_instance_id"], name=row["name"], purpose=row["purpose"],
             key_handle=row["key_handle"], key_version=row["key_version"],
             created_at=row["created_at"], deleted_at=row["deleted_at"],
@@ -278,6 +295,154 @@ class GovernedContextRepository:
             version = conn.execute(text("SELECT key_version FROM context_spaces WHERE space_id=:space"), {"space": space_id}).scalar_one()
         self._audit(actor, "membership.removed", "member-removal", space_id=space_id, detail={"person_id": person_id, "key_version": version})
         return int(version)
+
+    @staticmethod
+    def _artifact_from_record(record: MemoryRecord, household_id: str) -> HouseholdArtifact:
+        return HouseholdArtifact(
+            artifact_id=record.record_id,
+            household_id=household_id,
+            space_id=record.space_id,
+            kind=HouseholdArtifactKind(record.kind.value),
+            created_by_person_id=record.owner_person_id,
+            content=record.content,
+            revision=record.revision,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+    def coordinate_household_artifact(
+        self, actor: str, request: HouseholdCoordinationRequest
+    ) -> HouseholdCoordinationOutcome:
+        """Coordinate only through an explicitly shared household space."""
+        write = request.action is not CoordinationAction.LIST
+        self.require_access(actor, request.space_id, write=write)
+        space = self.get_space(request.space_id)
+        if (
+            space.kind is not SpaceKind.SHARED
+            or not space.household_id
+            or space.household_id != request.household_id
+        ):
+            raise ContextAccessDenied("context space is unavailable")
+
+        if request.action is CoordinationAction.LIST:
+            kinds = (
+                [MemoryKind(request.artifact_kind.value)] if request.artifact_kind else
+                [MemoryKind.CALENDAR_EVENT, MemoryKind.GROCERY_ITEM]
+            )
+            records = self.search(actor, space_ids=[space.space_id], kinds=kinds)
+            artifacts = tuple(self._artifact_from_record(item, space.household_id) for item in records)
+            return HouseholdCoordinationOutcome(
+                status=CoordinationStatus.COMPLETED,
+                action=request.action,
+                space_id=space.space_id,
+                artifacts=artifacts,
+                shared_facts=(SharedFact(name="artifact_count", value=len(artifacts)),),
+                explanation="Only artifacts in the selected shared household space were read.",
+            )
+
+        if request.action is CoordinationAction.CREATE:
+            content = (request.calendar or request.grocery).model_dump(mode="json", exclude_none=True)
+            record = self.admit_memory(
+                actor,
+                space_id=space.space_id,
+                kind=MemoryKind(request.artifact_kind.value),
+                content=content,
+                provenance="household-coordination",
+                governance=MemoryGovernance(
+                    sensitivity="household-shared",
+                    purposes=(request.purpose,),
+                    audiences=(f"space:{space.space_id}",),
+                    allow_inference=True,
+                    allow_action=True,
+                    allow_disclosure=True,
+                ),
+            )
+        else:
+            current = self.get_memory(actor, str(request.artifact_id))
+            if current.space_id != space.space_id or current.kind not in {
+                MemoryKind.CALENDAR_EVENT, MemoryKind.GROCERY_ITEM
+            }:
+                raise ContextAccessDenied("context space is unavailable")
+            if request.action is CoordinationAction.DELETE:
+                self.delete_memory(actor, current.record_id, reason="household coordination")
+                self._audit(
+                    actor, "household.artifact.deleted", request.purpose,
+                    space_id=space.space_id, record_id=current.record_id,
+                )
+                return HouseholdCoordinationOutcome(
+                    status=CoordinationStatus.COMPLETED,
+                    action=request.action,
+                    space_id=space.space_id,
+                    explanation="The shared artifact was removed without reading private memory.",
+                )
+            if current.kind.value != request.artifact_kind.value:
+                raise ContextAccessDenied("context space is unavailable")
+            content = (request.calendar or request.grocery).model_dump(mode="json", exclude_none=True)
+            record = self.correct_memory(actor, current.record_id, content, "household coordination")
+
+        artifact = self._artifact_from_record(record, space.household_id)
+        self._audit(
+            actor, f"household.artifact.{request.action.value}", request.purpose,
+            space_id=space.space_id, record_id=record.record_id,
+            detail={"kind": artifact.kind.value, "revision": artifact.revision},
+        )
+        return HouseholdCoordinationOutcome(
+            status=CoordinationStatus.COMPLETED,
+            action=request.action,
+            space_id=space.space_id,
+            artifact=artifact,
+            shared_facts=(
+                SharedFact(name="artifact_kind", value=artifact.kind.value),
+                SharedFact(name="revision", value=artifact.revision),
+            ),
+            explanation="The outcome used only explicitly shared household facts.",
+        )
+
+    def preview_share(
+        self, actor: str, record_id: str, target_space_id: str, purpose: str
+    ) -> SharePreview:
+        source = self.get_memory(actor, record_id)
+        self.require_access(actor, target_space_id, write=True)
+        target = self.get_space(target_space_id)
+        if target.kind is not SpaceKind.SHARED:
+            raise ContextAccessDenied("context space is unavailable")
+        members = self._active_members(target_space_id)
+        return SharePreview(
+            source_record_id=source.record_id,
+            target_space_id=target_space_id,
+            target_audience=tuple(sorted(members)),
+            fields_to_share=tuple(sorted(source.content)),
+            purpose=purpose,
+        )
+
+    def _active_members(self, space_id: str) -> set[str]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""SELECT person_id FROM space_memberships
+                WHERE space_id=:space AND state='active'"""), {"space": space_id}).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def list_audit_events(self, actor: str, space_id: str | None = None) -> list[dict[str, Any]]:
+        if space_id is not None:
+            self.require_access(actor, space_id)
+            allowed_spaces = {space_id}
+        else:
+            allowed_spaces = {space.space_id for space in self.list_spaces(actor)}
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("SELECT * FROM governed_audit ORDER BY created_at")).mappings().all()
+        visible = []
+        for row in rows:
+            if row["actor_person_id"] != actor and row["space_id"] not in allowed_spaces:
+                continue
+            detail = _loads(row["detail_json"], {})
+            visible.append({
+                "action": row["action"],
+                "purpose": row["purpose"],
+                "space_id": row["space_id"],
+                "record_id": row["record_id"],
+                "detail": detail if row["space_id"] in allowed_spaces else {},
+                "created_at": row["created_at"],
+            })
+        return visible
 
     def add_relationship(
         self, owner_person_id: str, *, subject_id: str, label: str,
