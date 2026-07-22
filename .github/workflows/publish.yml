@@ -10,11 +10,12 @@ permissions:
   packages: write
   id-token: write
   attestations: write
+  artifact-metadata: write
   security-events: write
 
 jobs:
   publish:
-    uses: project-unisonOS/unison-platform/.github/workflows/reusable-build.yml@e91355e176f88cafe3fda8b9591322194c459c74
+    uses: project-unisonOS/unison-platform/.github/workflows/reusable-build.yml@ee1593dae7c003651890e66918aed47cb03db06d
     with:
       image_name: unison-context
       domain: context
