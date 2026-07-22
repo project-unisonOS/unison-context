@@ -7,15 +7,15 @@ on:
 
 jobs:
   python-security:
-    uses: project-unisonOS/.github/.github/workflows/reusable-python-security.yml@464c814924465fd1a7dc06d3fea29daae5762a11
+    uses: project-unisonOS/.github/.github/workflows/reusable-python-security.yml@45118ffb52ee397cf7a510767154ee5b3705a850
     with:
       python-version: "3.12"
       working-directory: "."
-      unison-common-ref: "7d8ac82fd5605dba2791c9ed34148c69f40897cc"
+      unison-common-ref: "eef1a7353b2c795233daf0db6079b867ff2d98ba"
       enable-principal-binding-test-bypass: true
 
   container-supply-chain:
-    uses: project-unisonOS/.github/.github/workflows/reusable-container-supply-chain.yml@464c814924465fd1a7dc06d3fea29daae5762a11
+    uses: project-unisonOS/.github/.github/workflows/reusable-container-supply-chain.yml@45118ffb52ee397cf7a510767154ee5b3705a850
     with:
       image-name: unison-context
       dockerfile: Dockerfile
