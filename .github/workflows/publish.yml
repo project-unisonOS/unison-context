@@ -9,10 +9,12 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  attestations: write
+  security-events: write
 
 jobs:
   publish:
-    uses: project-unisonOS/unison-platform/.github/workflows/reusable-build.yml@main
+    uses: project-unisonOS/unison-platform/.github/workflows/reusable-build.yml@e91355e176f88cafe3fda8b9591322194c459c74
     with:
       image_name: unison-context
       domain: context
