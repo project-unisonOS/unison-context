@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   publish:
-    uses: project-unisonOS/unison-platform/.github/workflows/reusable-build.yml@e666326fcf872c7507a03a881e01c0ce24fa6ec7
+    uses: project-unisonOS/unison-platform/.github/workflows/reusable-build.yml@73cdf19d696bfc4e4df13f8403becb71c5d1ed38
     with:
       image_name: unison-context
       domain: context
