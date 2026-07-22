@@ -1,6 +1,6 @@
 FROM python:3.12-slim@sha256:fdab368dc2e04fab3180d04508b41732756cc442586f708021560ee1341f3d29 AS common_wheel
 
-ARG UNISON_COMMON_REF="7d8ac82fd5605dba2791c9ed34148c69f40897cc"
+ARG UNISON_COMMON_REF="eef1a7353b2c795233daf0db6079b867ff2d98ba"
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && pip wheel --no-cache-dir --no-deps --wheel-dir /tmp/wheels \
