@@ -54,6 +54,7 @@ app.add_middleware(
     public_paths={"/", "/health", "/healthz", "/ready", "/readyz", "/metrics", "/conversation/health", "/docs", "/openapi.json"},
     path_identity_patterns={
         r"/profile/(?P<person_id>[^/]+)": "person_id",
+        r"/interaction-profile/(?P<person_id>[^/]+)": "person_id",
         r"/dashboard/(?P<person_id>[^/]+)": "person_id",
         r"/conversation/(?P<person_id>[^/]+)/[^/]+": "person_id",
     },
