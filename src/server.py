@@ -39,6 +39,8 @@ from fastapi import APIRouter
 # Import settings as a top-level module since PYTHONPATH is set in the Dockerfile
 from settings import DEFAULT_CONTEXT_DB_PATH, ContextServiceSettings
 from governed_repository import AmbiguousContext, GovernedContextRepository
+from interaction_profiles import InteractionProfileRepository
+from unison_common import SituationalOverride
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
 from unison_common.household import HouseholdCoordinationRequest
 
@@ -79,6 +81,7 @@ _start_time = time.time()
 _conversation_store: Dict[str, Dict[str, Any]] = {}
 _ENGINE: Engine | None = None
 _GOVERNED: GovernedContextRepository | None = None
+_INTERACTION_PROFILES: InteractionProfileRepository | None = None
 _DB_PATH: Path = Path(os.getenv("UNISON_CONTEXT_DB_PATH", DEFAULT_CONTEXT_DB_PATH))
 _PROFILE_KEY: Optional[bytes] = None
 _KEY_BROKER: Optional[LocalDevelopmentKeyBroker] = None
@@ -136,7 +139,7 @@ def _index_key(key: str) -> str:
 
 def _init_db():
     """Initialize storage backend (Postgres via SQLAlchemy or SQLite fallback)."""
-    global _ENGINE, _GOVERNED
+    global _ENGINE, _GOVERNED, _INTERACTION_PROFILES
     db_url = _DB_URL or f"sqlite:///{_DB_PATH}"
     if os.getenv("ENVIRONMENT") == "prod" and db_url.startswith("sqlite"):
         raise RuntimeError("SQLite is not allowed in production; set UNISON_CONTEXT_DATABASE_URL to Postgres")
@@ -174,6 +177,12 @@ def _init_db():
         for ddl in ddl_statements:
             conn.execute(text(ddl))
     _GOVERNED = GovernedContextRepository(_ENGINE)
+    _INTERACTION_PROFILES = InteractionProfileRepository(_ENGINE)
+
+
+def _caller_person_id(request: Request, requested: str) -> str:
+    principal = get_bound_principal(request)
+    return principal.person_id if principal and principal.person_id else requested
 
 
 def _load_profile_key(raw: str) -> Optional[bytes]:
@@ -599,6 +608,66 @@ def profile_put(
     except Exception as exc:
         log_json(logging.WARNING, "profile_put_error", service="unison-context", error=str(exc))
         return {"ok": False, "error": "profile-store-failed"}
+
+
+@profile_router.get("/interaction-profile/{person_id}")
+def interaction_profile_get(request: Request, person_id: str):
+    try:
+        profile = _INTERACTION_PROFILES.get(_caller_person_id(request, person_id), person_id)
+        return {"ok": True, "profile": profile.model_dump(mode="json"), "effective": profile.effective_preferences()}
+    except Exception:
+        raise HTTPException(status_code=404, detail="interaction profile unavailable")
+
+
+@profile_router.post("/interaction-profile/{person_id}/proposals")
+def interaction_profile_propose(request: Request, person_id: str, body: Dict[str, Any] = Body(...)):
+    try:
+        profile = _INTERACTION_PROFILES.propose(
+            _caller_person_id(request, person_id), person_id,
+            key=str(body["key"]), value=body.get("value"), origin=str(body.get("origin", "explicit")),
+            provenance=str(body.get("provenance", "conversation")), confidence=float(body.get("confidence", 1.0)),
+        )
+        return {"ok": True, "profile": profile.model_dump(mode="json")}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@profile_router.post("/interaction-profile/{person_id}/proposals/{preference_id}/decision")
+def interaction_profile_decide(request: Request, person_id: str, preference_id: str, body: Dict[str, Any] = Body(...)):
+    try:
+        profile = _INTERACTION_PROFILES.decide(_caller_person_id(request, person_id), person_id, preference_id, bool(body.get("approve")))
+        return {"ok": True, "profile": profile.model_dump(mode="json")}
+    except Exception:
+        raise HTTPException(status_code=404, detail="preference unavailable")
+
+
+@profile_router.post("/interaction-profile/{person_id}/corrections")
+def interaction_profile_correct(request: Request, person_id: str, body: Dict[str, Any] = Body(...)):
+    profile = _INTERACTION_PROFILES.correct(_caller_person_id(request, person_id), person_id, key=str(body["key"]), value=body.get("value"))
+    return {"ok": True, "profile": profile.model_dump(mode="json")}
+
+
+@profile_router.post("/interaction-profile/{person_id}/overrides")
+def interaction_profile_override(request: Request, person_id: str, body: Dict[str, Any] = Body(...)):
+    profile = _INTERACTION_PROFILES.add_override(_caller_person_id(request, person_id), person_id, SituationalOverride.model_validate(body))
+    return {"ok": True, "profile": profile.model_dump(mode="json")}
+
+
+@profile_router.post("/interaction-profile/{person_id}/reset")
+def interaction_profile_reset(request: Request, person_id: str):
+    profile = _INTERACTION_PROFILES.reset(_caller_person_id(request, person_id), person_id)
+    return {"ok": True, "profile": profile.model_dump(mode="json")}
+
+
+@profile_router.get("/interaction-profile/{person_id}/export")
+def interaction_profile_export(request: Request, person_id: str):
+    return {"ok": True, "profile": _INTERACTION_PROFILES.export(_caller_person_id(request, person_id), person_id)}
+
+
+@profile_router.delete("/interaction-profile/{person_id}")
+def interaction_profile_delete(request: Request, person_id: str):
+    _INTERACTION_PROFILES.delete(_caller_person_id(request, person_id), person_id)
+    return {"ok": True}
 
 
 app.include_router(profile_router)
