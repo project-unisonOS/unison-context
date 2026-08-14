@@ -6,7 +6,10 @@ from sqlalchemy import create_engine, text
 from governed_repository import AmbiguousContext, ContextAccessDenied, GovernedContextRepository
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
 from unison_common.household import HouseholdCoordinationRequest
-from unison_common.governed_memory import AlgorithmProvenance, DerivedViewDescriptor, MemoryRetrievalRequest
+from unison_common.governed_memory import (
+    AlgorithmProvenance, DataDomainDefinition, DerivedViewDescriptor, MemoryRetrievalRequest,
+    TaxonomyDecision, TaxonomyUsageSignal,
+)
 
 
 @pytest.fixture
@@ -291,3 +294,58 @@ def test_correction_deletion_and_member_revocation_invalidate_derived_views(repo
     }))
     repo.remove_member("alice", shared.space_id, "bob")
     assert repo.invalidation_receipts("alice", shared_source.record_id)[0].reason == "membership-revocation"
+
+
+def test_usage_evidence_proposes_but_never_activates_without_person_approval(repo):
+    candidate = DataDomainDefinition(
+        domain_id="legal", display_name="Legal", description="Legal matters and records", origin="usage",
+    )
+    moments = (
+        datetime(2026, 8, 10, tzinfo=timezone.utc),
+        datetime(2026, 8, 10, 12, tzinfo=timezone.utc),
+        datetime(2026, 8, 11, tzinfo=timezone.utc),
+    )
+    for index, observed_at in enumerate(moments):
+        repo.observe_taxonomy_usage("alice", TaxonomyUsageSignal(
+            signal_id=f"legal-{index}", candidate_domain_id="legal",
+            current_domain_ids=("core-private",), signal_type="repeated-request",
+            suggested_level="security-domain", observed_at=observed_at,
+            source_reference=f"event-{index}",
+        ))
+    proposal = repo.evaluate_taxonomy_candidate("alice", candidate, "security-domain")
+    assert proposal is not None
+    assert proposal.evidence_count == 3
+    assert proposal.requires_explicit_approval is True
+    assert repo.list_taxonomy_domains("alice") == []
+    assert repo.list_taxonomy_proposals("bob") == []
+
+    receipt = repo.decide_taxonomy_proposal("alice", TaxonomyDecision(
+        decision_id="decision-legal", proposal_id=proposal.proposal_id,
+        decision="approve", explicit_confirmation=True, migration_scope="none",
+    ))
+    assert receipt is not None
+    assert receipt.migration_status == "not-started"
+    assert [item.domain_id for item in repo.list_taxonomy_domains("alice")] == ["legal"]
+
+
+def test_taxonomy_threshold_and_decline_cooldown_prevent_prompt_fatigue(repo):
+    candidate = DataDomainDefinition(
+        domain_id="projects", display_name="Projects", description="Long-running projects", origin="usage",
+    )
+    for index, day in enumerate((10, 11)):
+        repo.observe_taxonomy_usage("alice", TaxonomyUsageSignal(
+            signal_id=f"project-{index}", candidate_domain_id="projects",
+            signal_type="classification-correction", suggested_level="subdomain",
+            observed_at=datetime(2026, 8, day, tzinfo=timezone.utc),
+        ))
+    assert repo.evaluate_taxonomy_candidate("alice", candidate, "subdomain") is None
+    repo.observe_taxonomy_usage("alice", TaxonomyUsageSignal(
+        signal_id="project-2", candidate_domain_id="projects",
+        signal_type="classification-correction", suggested_level="subdomain",
+        observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+    ))
+    proposal = repo.evaluate_taxonomy_candidate("alice", candidate, "subdomain")
+    repo.decide_taxonomy_proposal("alice", TaxonomyDecision(
+        decision_id="decline-projects", proposal_id=proposal.proposal_id, decision="decline",
+    ))
+    assert repo.evaluate_taxonomy_candidate("alice", candidate, "subdomain") is None

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -25,9 +25,14 @@ from unison_common.governed_context import (
 )
 from unison_common.governed_memory import (
     AuthorizedContextPacket,
+    DataDomainDefinition,
     DerivedViewDescriptor,
     DerivedViewInvalidationReceipt,
     MemoryRetrievalRequest,
+    TaxonomyActivationReceipt,
+    TaxonomyDecision,
+    TaxonomyProposal,
+    TaxonomyUsageSignal,
 )
 from unison_common.household import (
     CoordinationAction,
@@ -140,6 +145,31 @@ class GovernedContextRepository:
                 source_record_id TEXT NOT NULL, receipt_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_usage_signals (
+                signal_id TEXT NOT NULL, owner_person_id TEXT NOT NULL,
+                candidate_domain_id TEXT NOT NULL, signal_type TEXT NOT NULL,
+                suggested_level TEXT NOT NULL, observed_at TEXT NOT NULL, signal_json TEXT NOT NULL,
+                PRIMARY KEY (owner_person_id, signal_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_proposals (
+                proposal_id TEXT PRIMARY KEY, owner_person_id TEXT NOT NULL,
+                candidate_domain_id TEXT NOT NULL, status TEXT NOT NULL,
+                created_at TEXT NOT NULL, cooldown_until TEXT, proposal_json TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_domains (
+                owner_person_id TEXT NOT NULL, domain_id TEXT NOT NULL, level TEXT NOT NULL,
+                activated_at TEXT NOT NULL, definition_json TEXT NOT NULL,
+                PRIMARY KEY (owner_person_id, domain_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_decisions (
+                decision_id TEXT NOT NULL, owner_person_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL, decision_json TEXT NOT NULL, decided_at TEXT NOT NULL,
+                PRIMARY KEY (owner_person_id, decision_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_activation_receipts (
+                receipt_id TEXT PRIMARY KEY, owner_person_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL, receipt_json TEXT NOT NULL, activated_at TEXT NOT NULL
+            )""",
             """CREATE INDEX IF NOT EXISTS idx_memory_space_state
                 ON memory_records(space_id, deletion_state, updated_at)""",
             """CREATE INDEX IF NOT EXISTS idx_membership_person_state
@@ -148,6 +178,8 @@ class GovernedContextRepository:
                 ON relationships(owner_person_id, subject_id, deleted_at)""",
             """CREATE INDEX IF NOT EXISTS idx_derived_view_source_state
                 ON derived_memory_views(source_record_id, state)""",
+            """CREATE INDEX IF NOT EXISTS idx_taxonomy_signal_candidate
+                ON taxonomy_usage_signals(owner_person_id, candidate_domain_id, observed_at)""",
         ]
         with self.engine.begin() as conn:
             for statement in statements:
@@ -156,6 +188,141 @@ class GovernedContextRepository:
         if "household_id" not in columns:
             with self.engine.begin() as conn:
                 conn.execute(text("ALTER TABLE context_spaces ADD COLUMN household_id TEXT"))
+
+    def observe_taxonomy_usage(self, actor: str, signal: TaxonomyUsageSignal) -> TaxonomyUsageSignal:
+        """Persist structured evidence only; raw request or memory content is not accepted."""
+        with self.engine.begin() as conn:
+            conn.execute(text("""INSERT INTO taxonomy_usage_signals
+                (signal_id, owner_person_id, candidate_domain_id, signal_type,
+                 suggested_level, observed_at, signal_json)
+                VALUES (:id, :owner, :candidate, :kind, :level, :observed, :payload)"""), {
+                "id": signal.signal_id, "owner": actor, "candidate": signal.candidate_domain_id,
+                "kind": signal.signal_type, "level": signal.suggested_level,
+                "observed": signal.observed_at.isoformat(), "payload": signal.model_dump_json(),
+            })
+        self._audit(actor, "taxonomy.signal.observed", "taxonomy-evolution", detail={
+            "candidate_domain_id": signal.candidate_domain_id, "signal_type": signal.signal_type,
+        })
+        return signal
+
+    def evaluate_taxonomy_candidate(
+        self, actor: str, candidate: DataDomainDefinition, proposed_level: str,
+    ) -> TaxonomyProposal | None:
+        if candidate.origin != "usage" or candidate.status != "proposed":
+            raise ValueError("usage-driven candidates must have usage origin and proposed status")
+        with self.engine.connect() as conn:
+            active = conn.execute(text("""SELECT 1 FROM taxonomy_domains
+                WHERE owner_person_id=:owner AND domain_id=:domain"""),
+                {"owner": actor, "domain": candidate.domain_id}).fetchone()
+            existing = conn.execute(text("""SELECT proposal_json FROM taxonomy_proposals
+                WHERE owner_person_id=:owner AND candidate_domain_id=:domain AND status='pending'
+                ORDER BY created_at DESC LIMIT 1"""),
+                {"owner": actor, "domain": candidate.domain_id}).scalar()
+            cooldown = conn.execute(text("""SELECT cooldown_until FROM taxonomy_proposals
+                WHERE owner_person_id=:owner AND candidate_domain_id=:domain
+                  AND cooldown_until IS NOT NULL ORDER BY cooldown_until DESC LIMIT 1"""),
+                {"owner": actor, "domain": candidate.domain_id}).scalar()
+            rows = conn.execute(text("""SELECT signal_type, suggested_level, observed_at
+                FROM taxonomy_usage_signals WHERE owner_person_id=:owner AND candidate_domain_id=:domain
+                ORDER BY observed_at"""), {"owner": actor, "domain": candidate.domain_id}).mappings().all()
+        if active:
+            return None
+        if existing:
+            return TaxonomyProposal.model_validate_json(existing)
+        if cooldown and datetime.fromisoformat(str(cooldown)) > _now():
+            return None
+        matching = [row for row in rows if row["suggested_level"] == proposed_level]
+        days = {datetime.fromisoformat(str(row["observed_at"])).date() for row in matching}
+        if len(matching) < 3 or len(days) < 2:
+            return None
+        evidence_types = tuple(sorted({str(row["signal_type"]) for row in matching}))
+        proposal = TaxonomyProposal(
+            proposal_id=str(uuid4()), candidate=candidate, proposed_level=proposed_level,
+            evidence_count=len(matching), distinct_days=len(days), evidence_types=evidence_types,
+            rationale=f"Repeated usage suggests '{candidate.display_name}' may need distinct handling.",
+            benefits=tuple(sorted({
+                "clearer retrieval and organization",
+                *( ["separate policy or key boundary"] if proposed_level == "security-domain" else []),
+                *( ["more precise retention or sharing choices"] if any("friction" in item for item in evidence_types) else []),
+            })),
+        )
+        with self.engine.begin() as conn:
+            conn.execute(text("""INSERT INTO taxonomy_proposals
+                (proposal_id, owner_person_id, candidate_domain_id, status, created_at, cooldown_until, proposal_json)
+                VALUES (:id, :owner, :domain, 'pending', :created, NULL, :payload)"""), {
+                "id": proposal.proposal_id, "owner": actor, "domain": candidate.domain_id,
+                "created": proposal.created_at.isoformat(), "payload": proposal.model_dump_json(),
+            })
+        self._audit(actor, "taxonomy.proposal.created", "taxonomy-evolution", detail={
+            "proposal_id": proposal.proposal_id, "candidate_domain_id": candidate.domain_id,
+            "evidence_count": proposal.evidence_count,
+        })
+        return proposal
+
+    def list_taxonomy_proposals(self, actor: str) -> list[TaxonomyProposal]:
+        with self.engine.connect() as conn:
+            values = conn.execute(text("""SELECT proposal_json FROM taxonomy_proposals
+                WHERE owner_person_id=:owner ORDER BY created_at, proposal_id"""), {"owner": actor}).scalars().all()
+        return [TaxonomyProposal.model_validate_json(value) for value in values]
+
+    def list_taxonomy_domains(self, actor: str) -> list[DataDomainDefinition]:
+        with self.engine.connect() as conn:
+            values = conn.execute(text("""SELECT definition_json FROM taxonomy_domains
+                WHERE owner_person_id=:owner ORDER BY domain_id"""), {"owner": actor}).scalars().all()
+        return [DataDomainDefinition.model_validate_json(value) for value in values]
+
+    def decide_taxonomy_proposal(
+        self, actor: str, decision: TaxonomyDecision,
+    ) -> TaxonomyActivationReceipt | None:
+        with self.engine.connect() as conn:
+            raw = conn.execute(text("""SELECT proposal_json FROM taxonomy_proposals
+                WHERE proposal_id=:id AND owner_person_id=:owner AND status='pending'"""),
+                {"id": decision.proposal_id, "owner": actor}).scalar()
+        if not raw:
+            raise ContextAccessDenied("taxonomy proposal is unavailable")
+        proposal = TaxonomyProposal.model_validate_json(raw)
+        new_status = {"approve": "approved", "decline": "declined", "defer": "deferred"}[decision.decision]
+        cooldown_until = None
+        if decision.decision in {"decline", "defer"}:
+            cooldown_until = _now() + timedelta(days=90 if decision.decision == "decline" else 30)
+        updated = proposal.model_copy(update={"status": new_status, "cooldown_until": cooldown_until})
+        receipt = None
+        if decision.decision == "approve":
+            active = proposal.candidate.model_copy(update={"status": "active"})
+            receipt = TaxonomyActivationReceipt(
+                receipt_id=str(uuid4()), proposal_id=proposal.proposal_id,
+                decision_id=decision.decision_id, domain=active,
+                migration_scope=decision.migration_scope,
+            )
+        with self.engine.begin() as conn:
+            conn.execute(text("""UPDATE taxonomy_proposals SET status=:status,
+                cooldown_until=:cooldown, proposal_json=:payload WHERE proposal_id=:id"""), {
+                "status": new_status, "cooldown": cooldown_until.isoformat() if cooldown_until else None,
+                "payload": updated.model_dump_json(), "id": proposal.proposal_id,
+            })
+            conn.execute(text("""INSERT INTO taxonomy_decisions
+                (decision_id, owner_person_id, proposal_id, decision_json, decided_at)
+                VALUES (:id, :owner, :proposal, :payload, :at)"""), {
+                "id": decision.decision_id, "owner": actor, "proposal": proposal.proposal_id,
+                "payload": decision.model_dump_json(), "at": decision.decided_at.isoformat(),
+            })
+            if receipt:
+                conn.execute(text("""INSERT INTO taxonomy_domains
+                    (owner_person_id, domain_id, level, activated_at, definition_json)
+                    VALUES (:owner, :domain, :level, :at, :payload)"""), {
+                    "owner": actor, "domain": receipt.domain.domain_id, "level": proposal.proposed_level,
+                    "at": receipt.activated_at.isoformat(), "payload": receipt.domain.model_dump_json(),
+                })
+                conn.execute(text("""INSERT INTO taxonomy_activation_receipts
+                    (receipt_id, owner_person_id, proposal_id, receipt_json, activated_at)
+                    VALUES (:id, :owner, :proposal, :payload, :at)"""), {
+                    "id": receipt.receipt_id, "owner": actor, "proposal": proposal.proposal_id,
+                    "payload": receipt.model_dump_json(), "at": receipt.activated_at.isoformat(),
+                })
+        self._audit(actor, f"taxonomy.proposal.{new_status}", "taxonomy-evolution", detail={
+            "proposal_id": proposal.proposal_id, "domain_id": proposal.candidate.domain_id,
+        })
+        return receipt
 
     def _audit(
         self,
