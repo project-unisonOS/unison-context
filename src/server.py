@@ -42,6 +42,7 @@ from governed_repository import AmbiguousContext, GovernedContextRepository
 from interaction_profiles import InteractionProfileRepository
 from unison_common import SituationalOverride
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
+from unison_common.governed_memory import DerivedViewDescriptor, MemoryRetrievalRequest
 from unison_common.household import HouseholdCoordinationRequest
 
 app = FastAPI(title="unison-context")
@@ -971,6 +972,43 @@ def governed_prompt_context(request: Request, body: Dict[str, Any] = Body(...)):
             actor, space_ids=body.get("space_ids") or (), query=str(body.get("query") or ""),
             purpose=str(body.get("purpose") or "answer"),
         )
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/retrieve")
+def governed_retrieve(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        value = dict(body)
+        value.pop("person_id", None)
+        retrieval = MemoryRetrievalRequest.model_validate(value)
+        return _repo().retrieve_context(actor, retrieval).model_dump(mode="json")
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/derived-views")
+def governed_register_derived_view(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        value = dict(body)
+        value.pop("person_id", None)
+        principal = get_current_principal()
+        value["index_namespace"] = principal.index_namespace if principal else f"index:{actor}"
+        descriptor = DerivedViewDescriptor.model_validate(value)
+        return {"view": _repo().register_derived_view(actor, descriptor).model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.get("/v2/memory/{record_id}/invalidation-receipts")
+def governed_invalidation_receipts(record_id: str, request: Request, person_id: str | None = None):
+    actor, _ = _governed_actor(request, person_id)
+    try:
+        return {"receipts": [
+            item.model_dump(mode="json") for item in _repo().invalidation_receipts(actor, record_id)
+        ]}
     except Exception as exc:
         raise _context_error(exc) from exc
 
