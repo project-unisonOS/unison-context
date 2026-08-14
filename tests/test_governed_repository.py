@@ -6,6 +6,7 @@ from sqlalchemy import create_engine, text
 from governed_repository import AmbiguousContext, ContextAccessDenied, GovernedContextRepository
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
 from unison_common.household import HouseholdCoordinationRequest
+from unison_common.governed_memory import AlgorithmProvenance, DerivedViewDescriptor, MemoryRetrievalRequest
 
 
 @pytest.fixture
@@ -234,3 +235,59 @@ def test_prompt_context_enforces_record_purpose(repo):
     )
     assert denied["records"] == []
     assert len(allowed["records"]) == 1
+
+
+def test_domain_filtering_precedes_ranking_and_cross_domain_access_is_explicit(repo):
+    private, _ = _people(repo)
+    for domain, value in (("health", "synthetic-medication"), ("financial", "synthetic-balance")):
+        repo.admit_memory(
+            "alice", space_id=private.space_id, kind=MemoryKind.ASSERTED_FACT,
+            content={"value": value}, provenance=f"synthetic:{domain}",
+            governance=MemoryGovernance(
+                data_domains=(domain,), key_domain=domain,
+                purposes=("planning",), allow_inference=True,
+            ),
+        )
+    health = repo.retrieve_context("alice", MemoryRetrievalRequest(
+        space_ids=(private.space_id,), data_domains=("health",),
+        purpose="planning", query="synthetic",
+    ))
+    assert [record["content"]["value"] for record in health.records] == ["synthetic-medication"]
+    assert health.remote_allowed is False
+    assert health.citations == ("synthetic:health",)
+
+
+def test_correction_deletion_and_member_revocation_invalidate_derived_views(repo):
+    private, _ = _people(repo)
+    source = repo.admit_memory(
+        "alice", space_id=private.space_id, kind=MemoryKind.ASSERTED_FACT,
+        content={"preference": "quiet"}, provenance="synthetic",
+        governance=MemoryGovernance(data_domains=("core-private",), key_domain="core-private"),
+    )
+    descriptor = DerivedViewDescriptor(
+        view_id="embedding-1", view_kind="embedding", source_record_id=source.record_id,
+        source_revision=source.revision, space_id=source.space_id,
+        data_domains=("core-private",), index_namespace="index:alice:core-private",
+        algorithm=AlgorithmProvenance(algorithm_id="synthetic-embed", algorithm_version="1"),
+    )
+    repo.register_derived_view("alice", descriptor)
+    repo.correct_memory("alice", source.record_id, {"preference": "calm"}, "person correction")
+    receipts = repo.invalidation_receipts("alice", source.record_id)
+    assert [(receipt.view_id, receipt.reason) for receipt in receipts] == [("embedding-1", "correction")]
+
+    shared = repo.create_space("alice", household_id="household-one", name="Shared", purpose="coordinate")
+    repo.invite_member("alice", shared.space_id, "bob", MemberRole.VIEWER)
+    repo.accept_invitation("bob", shared.space_id)
+    shared_source = repo.admit_memory(
+        "alice", space_id=shared.space_id, kind=MemoryKind.ASSERTED_FACT,
+        content={"maintenance": "synthetic"}, provenance="synthetic",
+        governance=MemoryGovernance(data_domains=("household-shared",), key_domain="household-shared"),
+    )
+    repo.register_derived_view("alice", descriptor.model_copy(update={
+        "view_id": "summary-1", "view_kind": "summary",
+        "source_record_id": shared_source.record_id, "source_revision": 1,
+        "space_id": shared.space_id, "data_domains": ("household-shared",),
+        "index_namespace": "index:household:shared",
+    }))
+    repo.remove_member("alice", shared.space_id, "bob")
+    assert repo.invalidation_receipts("alice", shared_source.record_id)[0].reason == "membership-revocation"

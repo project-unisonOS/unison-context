@@ -67,3 +67,41 @@ def test_governed_api_ambiguous_relationship_requires_choice(tmp_path, monkeypat
     ambiguous = client.get("/v2/relationships/sam/resolve", params={"person_id": "alice"})
     assert ambiguous.status_code == 409
     assert ambiguous.json()["detail"] == "context choice required"
+
+
+def test_governed_memory_api_filters_domains_and_returns_invalidation_receipts(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNISON_PRINCIPAL_BINDING_TEST_BYPASS", "true")
+    server._GOVERNED = GovernedContextRepository(create_engine(f"sqlite:///{tmp_path / 'memory.db'}", future=True))
+    client = TestClient(server.app)
+    private = client.post("/v2/spaces/private", json={"person_id": "alice"}).json()["space"]
+    health = client.post("/v2/memory", json={
+        "person_id": "alice", "space_id": private["space_id"], "kind": "asserted_fact",
+        "content": {"value": "synthetic-health"}, "provenance": "synthetic:health",
+        "governance": {"data_domains": ["health"], "key_domain": "health", "allow_inference": True},
+    }).json()["record"]
+    client.post("/v2/memory", json={
+        "person_id": "alice", "space_id": private["space_id"], "kind": "asserted_fact",
+        "content": {"value": "synthetic-financial"}, "provenance": "synthetic:financial",
+        "governance": {"data_domains": ["financial"], "key_domain": "financial", "allow_inference": True},
+    }).raise_for_status()
+
+    packet = client.post("/v2/memory/retrieve", json={
+        "person_id": "alice", "space_ids": [private["space_id"]],
+        "data_domains": ["health"], "purpose": "answer", "query": "synthetic",
+    }).json()
+    assert [item["content"]["value"] for item in packet["records"]] == ["synthetic-health"]
+    assert packet["remote_allowed"] is False
+
+    client.post("/v2/memory/derived-views", json={
+        "person_id": "alice", "view_id": "embedding-api-1", "view_kind": "embedding",
+        "source_record_id": health["record_id"], "source_revision": health["revision"],
+        "space_id": private["space_id"], "data_domains": ["health"],
+        "algorithm": {"algorithm_id": "synthetic", "algorithm_version": "1"},
+    }).raise_for_status()
+    client.post(f"/v2/memory/{health['record_id']}/correct", json={
+        "person_id": "alice", "content": {"value": "synthetic-corrected"}, "reason": "person correction",
+    }).raise_for_status()
+    receipts = client.get(
+        f"/v2/memory/{health['record_id']}/invalidation-receipts", params={"person_id": "alice"},
+    ).json()["receipts"]
+    assert [(item["view_id"], item["reason"]) for item in receipts] == [("embedding-api-1", "correction")]

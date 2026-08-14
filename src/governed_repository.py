@@ -23,6 +23,12 @@ from unison_common.governed_context import (
     SpaceKind,
     SpaceMembership,
 )
+from unison_common.governed_memory import (
+    AuthorizedContextPacket,
+    DerivedViewDescriptor,
+    DerivedViewInvalidationReceipt,
+    MemoryRetrievalRequest,
+)
 from unison_common.household import (
     CoordinationAction,
     CoordinationStatus,
@@ -123,12 +129,25 @@ class GovernedContextRepository:
                 migrated_at TEXT NOT NULL, record_count INTEGER NOT NULL,
                 PRIMARY KEY (person_id, source_table)
             )""",
+            """CREATE TABLE IF NOT EXISTS derived_memory_views (
+                view_id TEXT PRIMARY KEY, source_record_id TEXT NOT NULL,
+                source_revision INTEGER NOT NULL, space_id TEXT NOT NULL,
+                descriptor_json TEXT NOT NULL, state TEXT NOT NULL,
+                created_at TEXT NOT NULL, invalidated_at TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS derived_view_invalidation_receipts (
+                receipt_id TEXT PRIMARY KEY, view_id TEXT NOT NULL,
+                source_record_id TEXT NOT NULL, receipt_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )""",
             """CREATE INDEX IF NOT EXISTS idx_memory_space_state
                 ON memory_records(space_id, deletion_state, updated_at)""",
             """CREATE INDEX IF NOT EXISTS idx_membership_person_state
                 ON space_memberships(person_id, state, space_id)""",
             """CREATE INDEX IF NOT EXISTS idx_relationship_owner_subject
                 ON relationships(owner_person_id, subject_id, deleted_at)""",
+            """CREATE INDEX IF NOT EXISTS idx_derived_view_source_state
+                ON derived_memory_views(source_record_id, state)""",
         ]
         with self.engine.begin() as conn:
             for statement in statements:
@@ -294,6 +313,7 @@ class GovernedContextRepository:
             conn.execute(text("UPDATE context_spaces SET key_version=key_version+1 WHERE space_id=:space"), {"space": space_id})
             version = conn.execute(text("SELECT key_version FROM context_spaces WHERE space_id=:space"), {"space": space_id}).scalar_one()
         self._audit(actor, "membership.removed", "member-removal", space_id=space_id, detail={"person_id": person_id, "key_version": version})
+        self.invalidate_space_views(space_id, "membership-revocation")
         return int(version)
 
     @staticmethod
@@ -350,6 +370,8 @@ class GovernedContextRepository:
                 provenance="household-coordination",
                 governance=MemoryGovernance(
                     sensitivity="household-shared",
+                    data_domains=("household-shared",),
+                    key_domain="household-shared",
                     purposes=(request.purpose,),
                     audiences=(f"space:{space.space_id}",),
                     allow_inference=True,
@@ -544,7 +566,7 @@ class GovernedContextRepository:
 
     def search(
         self, actor: str, *, query: str = "", space_ids: Iterable[str] | None = None,
-        kinds: Iterable[MemoryKind] | None = None,
+        kinds: Iterable[MemoryKind] | None = None, data_domains: Iterable[str] | None = None,
     ) -> list[MemoryRecord]:
         requested = list(space_ids or [])
         if not requested:
@@ -566,6 +588,12 @@ class GovernedContextRepository:
             rows = conn.execute(text(sql).bindparams(*expanding), params).mappings().all()
         needle = query.casefold().strip()
         records = [self._record_from_row(row) for row in rows]
+        requested_domains = frozenset(data_domains or ())
+        if requested_domains:
+            records = [
+                record for record in records
+                if requested_domains.intersection(record.governance.data_domains)
+            ]
         if needle:
             records = [record for record in records if needle in json.dumps(record.content, sort_keys=True).casefold()]
         return records
@@ -574,23 +602,108 @@ class GovernedContextRepository:
         requested = tuple(space_ids)
         if not requested:
             raise AmbiguousContext("an explicit context space is required")
-        records = self.search(actor, query=query, space_ids=requested)
-        spaces = [self.get_space(space_id) for space_id in requested]
+        packet = self.retrieve_context(actor, MemoryRetrievalRequest(
+            space_ids=requested, data_domains=("core-private",),
+            query=query, purpose=purpose,
+        ))
+        spaces = [self.get_space(space_id) for space_id in packet.space_ids]
+        privacy = SemanticPrivacyState(
+            active_space_ids=packet.space_ids,
+            space_kinds=tuple(space.kind for space in spaces),
+            purpose=purpose, contains_inferences=packet.contains_inferences,
+            disclosure_allowed=packet.disclosure_allowed,
+        )
+        return {
+            "records": list(packet.records),
+            "privacy": privacy.model_dump(mode="json"),
+            "context_packet": packet.model_dump(mode="json"),
+        }
+
+    def retrieve_context(self, actor: str, request: MemoryRetrievalRequest) -> AuthorizedContextPacket:
+        requested = tuple(request.space_ids)
+        records = self.search(
+            actor, query=request.query, space_ids=requested,
+            data_domains=request.data_domains,
+        )
+        for space_id in requested:
+            self.get_space(space_id)
         allowed = [
             record
             for record in records
             if record.governance.allow_inference
-            and (not record.governance.purposes or purpose in record.governance.purposes)
+            and (not record.governance.purposes or request.purpose in record.governance.purposes)
         ]
-        privacy = SemanticPrivacyState(
-            active_space_ids=requested, space_kinds=tuple(space.kind for space in spaces),
-            purpose=purpose, contains_inferences=any(record.kind is MemoryKind.INFERRED_HYPOTHESIS for record in allowed),
-            disclosure_allowed=False,
+        bounded: list[MemoryRecord] = []
+        used_tokens = 0
+        for record in allowed:
+            estimate = max(1, len(json.dumps(record.content, sort_keys=True)) // 4)
+            if used_tokens + estimate > request.token_budget:
+                break
+            bounded.append(record)
+            used_tokens += estimate
+        return AuthorizedContextPacket(
+            purpose=request.purpose, space_ids=requested,
+            data_domains=request.data_domains, token_budget=request.token_budget,
+            records=tuple(record.model_dump(mode="json") for record in bounded),
+            citations=tuple(record.provenance for record in bounded),
+            contains_inferences=any(record.kind is MemoryKind.INFERRED_HYPOTHESIS for record in bounded),
+            disclosure_allowed=False, remote_allowed=False,
         )
-        return {
-            "records": [record.model_dump(mode="json") for record in allowed],
-            "privacy": privacy.model_dump(mode="json"),
-        }
+
+    def register_derived_view(self, actor: str, descriptor: DerivedViewDescriptor) -> DerivedViewDescriptor:
+        source = self.get_memory(actor, descriptor.source_record_id)
+        if (
+            source.space_id != descriptor.space_id
+            or source.revision != descriptor.source_revision
+            or not set(descriptor.data_domains).issubset(source.governance.data_domains)
+        ):
+            raise ContextAccessDenied("derived view source is unavailable")
+        with self.engine.begin() as conn:
+            conn.execute(text("""INSERT INTO derived_memory_views
+                (view_id, source_record_id, source_revision, space_id, descriptor_json,
+                 state, created_at, invalidated_at)
+                VALUES (:view, :record, :revision, :space, :descriptor, 'active', :created, NULL)"""), {
+                "view": descriptor.view_id, "record": descriptor.source_record_id,
+                "revision": descriptor.source_revision, "space": descriptor.space_id,
+                "descriptor": descriptor.model_dump_json(), "created": descriptor.created_at.isoformat(),
+            })
+        return descriptor
+
+    def _invalidate_views(self, where: str, params: dict[str, Any], reason: str) -> list[DerivedViewInvalidationReceipt]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(text(
+                f"SELECT * FROM derived_memory_views WHERE state='active' AND {where}"  # nosec B608 - internal fixed clauses only
+            ), params).mappings().all()
+        receipts = [DerivedViewInvalidationReceipt(
+            receipt_id=str(uuid4()), view_id=row["view_id"],
+            source_record_id=row["source_record_id"], source_revision=row["source_revision"],
+            reason=reason,
+        ) for row in rows]
+        with self.engine.begin() as conn:
+            for receipt in receipts:
+                conn.execute(text("UPDATE derived_memory_views SET state='invalidated', invalidated_at=:at WHERE view_id=:view"),
+                             {"at": receipt.invalidated_at.isoformat(), "view": receipt.view_id})
+                conn.execute(text("""INSERT INTO derived_view_invalidation_receipts
+                    (receipt_id, view_id, source_record_id, receipt_json, created_at)
+                    VALUES (:id, :view, :record, :receipt, :created)"""), {
+                    "id": receipt.receipt_id, "view": receipt.view_id,
+                    "record": receipt.source_record_id, "receipt": receipt.model_dump_json(),
+                    "created": receipt.invalidated_at.isoformat(),
+                })
+        return receipts
+
+    def invalidate_record_views(self, record_id: str, reason: str) -> list[DerivedViewInvalidationReceipt]:
+        return self._invalidate_views("source_record_id=:record", {"record": record_id}, reason)
+
+    def invalidate_space_views(self, space_id: str, reason: str) -> list[DerivedViewInvalidationReceipt]:
+        return self._invalidate_views("space_id=:space", {"space": space_id}, reason)
+
+    def invalidation_receipts(self, actor: str, record_id: str) -> list[DerivedViewInvalidationReceipt]:
+        self.get_memory(actor, record_id)
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""SELECT receipt_json FROM derived_view_invalidation_receipts
+                WHERE source_record_id=:record ORDER BY created_at, receipt_id"""), {"record": record_id}).scalars().all()
+        return [DerivedViewInvalidationReceipt.model_validate_json(value) for value in rows]
 
     def share_memory(self, actor: str, record_id: str, target_space_id: str) -> MemoryRecord:
         source = self.get_memory(actor, record_id)
@@ -629,6 +742,7 @@ class GovernedContextRepository:
                 "revision": revision, "now": now, "record": record_id,
             })
         self._audit(actor, "memory.corrected", "user-correction", space_id=current.space_id, record_id=record_id, detail={"revision": revision, "reason": reason})
+        self.invalidate_record_views(record_id, "correction")
         return self.get_memory(actor, record_id)
 
     def delete_memory(self, actor: str, record_id: str, reason: str = "user request") -> None:
@@ -642,6 +756,7 @@ class GovernedContextRepository:
                 {"record": record_id},
             )
         self._audit(actor, "memory.deleted", "deletion", space_id=current.space_id, record_id=record_id, detail={"reason": reason})
+        self.invalidate_record_views(record_id, "deletion")
 
     def reconcile_retention(self, now: datetime | None = None) -> list[str]:
         current = now or _now()
@@ -660,6 +775,7 @@ class GovernedContextRepository:
                         {"record": row["record_id"]},
                     )
                 expired.append(str(row["record_id"]))
+                self.invalidate_record_views(str(row["record_id"]), "retention-expiry")
         return expired
 
     def inspect_memory(self, actor: str, record_id: str) -> dict[str, Any]:
