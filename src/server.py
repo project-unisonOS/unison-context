@@ -42,7 +42,10 @@ from governed_repository import AmbiguousContext, GovernedContextRepository
 from interaction_profiles import InteractionProfileRepository
 from unison_common import SituationalOverride
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
-from unison_common.governed_memory import DerivedViewDescriptor, MemoryRetrievalRequest
+from unison_common.governed_memory import (
+    DataDomainDefinition, DerivedViewDescriptor, MemoryRetrievalRequest,
+    TaxonomyDecision, TaxonomyUsageSignal,
+)
 from unison_common.household import HouseholdCoordinationRequest
 
 app = FastAPI(title="unison-context")
@@ -1118,6 +1121,55 @@ def governed_commitments(request: Request, person_id: str | None = None):
 def governed_migrate_legacy(request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
     actor, assistant = _governed_actor(request, body.get("person_id"))
     return {"migrated": _repo().migrate_legacy_private(actor, assistant), "shared_promotions": 0}
+
+
+@app.post("/v2/taxonomy/signals")
+def governed_taxonomy_signal(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        value = dict(body)
+        value.pop("person_id", None)
+        signal = TaxonomyUsageSignal.model_validate(value)
+        return {"signal": _repo().observe_taxonomy_usage(actor, signal).model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/taxonomy/proposals/evaluate")
+def governed_taxonomy_evaluate(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        proposal = _repo().evaluate_taxonomy_candidate(
+            actor, DataDomainDefinition.model_validate(body["candidate"]), str(body["proposed_level"]),
+        )
+        return {"proposal": proposal.model_dump(mode="json") if proposal else None, "activation": "none"}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.get("/v2/taxonomy/proposals")
+def governed_taxonomy_proposals(request: Request, person_id: str | None = None):
+    actor, _ = _governed_actor(request, person_id)
+    return {"proposals": [item.model_dump(mode="json") for item in _repo().list_taxonomy_proposals(actor)]}
+
+
+@app.post("/v2/taxonomy/proposals/{proposal_id}/decision")
+def governed_taxonomy_decision(proposal_id: str, request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        value = dict(body)
+        value.pop("person_id", None)
+        value["proposal_id"] = proposal_id
+        receipt = _repo().decide_taxonomy_proposal(actor, TaxonomyDecision.model_validate(value))
+        return {"receipt": receipt.model_dump(mode="json") if receipt else None}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.get("/v2/taxonomy/domains")
+def governed_taxonomy_domains(request: Request, person_id: str | None = None):
+    actor, _ = _governed_actor(request, person_id)
+    return {"domains": [item.model_dump(mode="json") for item in _repo().list_taxonomy_domains(actor)]}
 
 if __name__ == "__main__":
     # Bind to the container port directly; settings currently only cover downstream deps.
