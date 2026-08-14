@@ -44,7 +44,8 @@ from unison_common import SituationalOverride
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
 from unison_common.governed_memory import (
     DataDomainDefinition, DerivedViewDescriptor, MemoryRetrievalRequest,
-    TaxonomyDecision, TaxonomyUsageSignal,
+    TaxonomyDecision, TaxonomyMigrationCommand, TaxonomySecurityReview,
+    TaxonomyUsageSignal,
 )
 from unison_common.household import HouseholdCoordinationRequest
 
@@ -1170,6 +1171,63 @@ def governed_taxonomy_decision(proposal_id: str, request: Request, body: Dict[st
 def governed_taxonomy_domains(request: Request, person_id: str | None = None):
     actor, _ = _governed_actor(request, person_id)
     return {"domains": [item.model_dump(mode="json") for item in _repo().list_taxonomy_domains(actor)]}
+
+
+@app.get("/v2/taxonomy/proposals/{proposal_id}/preview")
+def governed_taxonomy_preview(proposal_id: str, request: Request, person_id: str | None = None):
+    actor, _ = _governed_actor(request, person_id)
+    try:
+        return {"preview": _repo().taxonomy_proposal_preview(actor, proposal_id).model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/taxonomy/proposals/{proposal_id}/security-review")
+def governed_taxonomy_security_review(proposal_id: str, request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        value = dict(body)
+        value.pop("person_id", None)
+        value["proposal_id"] = proposal_id
+        review = _repo().record_taxonomy_security_review(actor, TaxonomySecurityReview.model_validate(value))
+        return {"review": review.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/taxonomy/proposals/{proposal_id}/migration-preview")
+def governed_taxonomy_migration_preview(proposal_id: str, request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        preview = _repo().preview_taxonomy_migration(
+            actor, proposal_id, source_domain_ids=body.get("source_domain_ids") or (),
+            selected_record_ids=body.get("selected_record_ids") or (),
+        )
+        return {"preview": preview.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/taxonomy/migrations")
+def governed_taxonomy_migrate(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        value = dict(body)
+        value.pop("person_id", None)
+        receipt = _repo().execute_taxonomy_migration(actor, TaxonomyMigrationCommand.model_validate(value))
+        return {"receipt": receipt.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/taxonomy/migrations/{migration_id}/rollback")
+def governed_taxonomy_rollback(migration_id: str, request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        receipt = _repo().rollback_taxonomy_migration(actor, migration_id)
+        return {"receipt": receipt.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
 
 if __name__ == "__main__":
     # Bind to the container port directly; settings currently only cover downstream deps.

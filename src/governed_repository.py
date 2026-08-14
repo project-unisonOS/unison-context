@@ -31,8 +31,15 @@ from unison_common.governed_memory import (
     MemoryRetrievalRequest,
     TaxonomyActivationReceipt,
     TaxonomyDecision,
+    TaxonomyMigrationCommand,
+    TaxonomyMigrationPreview,
+    TaxonomyMigrationReceipt,
     TaxonomyProposal,
+    TaxonomyProposalPreview,
+    TaxonomyRollbackReceipt,
+    TaxonomySecurityReview,
     TaxonomyUsageSignal,
+    taxonomy_preview_digest,
 )
 from unison_common.household import (
     CoordinationAction,
@@ -170,6 +177,32 @@ class GovernedContextRepository:
                 receipt_id TEXT PRIMARY KEY, owner_person_id TEXT NOT NULL,
                 proposal_id TEXT NOT NULL, receipt_json TEXT NOT NULL, activated_at TEXT NOT NULL
             )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_security_reviews (
+                review_id TEXT NOT NULL, owner_person_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL, decision TEXT NOT NULL,
+                review_json TEXT NOT NULL, reviewed_at TEXT NOT NULL,
+                PRIMARY KEY (owner_person_id, review_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_migration_previews (
+                preview_id TEXT PRIMARY KEY, owner_person_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL, preview_json TEXT NOT NULL,
+                expires_at TEXT NOT NULL, state TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_migrations (
+                migration_id TEXT PRIMARY KEY, owner_person_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL, receipt_json TEXT NOT NULL,
+                status TEXT NOT NULL, rollback_until TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_migration_items (
+                migration_id TEXT NOT NULL, record_id TEXT NOT NULL,
+                prior_governance_json TEXT NOT NULL, prior_revision INTEGER NOT NULL,
+                PRIMARY KEY (migration_id, record_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS taxonomy_rollback_receipts (
+                rollback_id TEXT PRIMARY KEY, owner_person_id TEXT NOT NULL,
+                migration_id TEXT NOT NULL, receipt_json TEXT NOT NULL,
+                rolled_back_at TEXT NOT NULL
+            )""",
             """CREATE INDEX IF NOT EXISTS idx_memory_space_state
                 ON memory_records(space_id, deletion_state, updated_at)""",
             """CREATE INDEX IF NOT EXISTS idx_membership_person_state
@@ -271,6 +304,66 @@ class GovernedContextRepository:
                 WHERE owner_person_id=:owner ORDER BY domain_id"""), {"owner": actor}).scalars().all()
         return [DataDomainDefinition.model_validate_json(value) for value in values]
 
+    def taxonomy_proposal_preview(self, actor: str, proposal_id: str) -> TaxonomyProposalPreview:
+        proposal = self._taxonomy_proposal(actor, proposal_id)
+        security = proposal.proposed_level == "security-domain"
+        return TaxonomyProposalPreview(
+            proposal_id=proposal.proposal_id,
+            prompt=(f"You have used {proposal.candidate.display_name} often enough that it may help "
+                    f"to make it a separate {'protected area' if security else 'category'}. Would you like that?"),
+            summary=f"Create {proposal.candidate.display_name} as a {proposal.proposed_level}.",
+            why_now=(
+                f"Observed {proposal.evidence_count} relevant patterns across {proposal.distinct_days} days.",
+                *tuple(f"Signal: {item.replace('-', ' ')}." for item in proposal.evidence_types),
+            ),
+            would_change=(
+                "Future requests can use this category explicitly.",
+                "Existing records change only after a separate migration preview and confirmation.",
+                *( ("A separate logical key and policy boundary will be required.",) if security else ()),
+            ),
+            would_not_change=(
+                "No records move when you approve the category.",
+                "No sharing, disclosure, or remote access is enabled.",
+                "You can defer or decline without limiting Unison's ability to help.",
+            ),
+            requires_security_review=security,
+        )
+
+    def _taxonomy_proposal(self, actor: str, proposal_id: str) -> TaxonomyProposal:
+        with self.engine.connect() as conn:
+            raw = conn.execute(text("""SELECT proposal_json FROM taxonomy_proposals
+                WHERE proposal_id=:id AND owner_person_id=:owner"""),
+                {"id": proposal_id, "owner": actor}).scalar()
+        if not raw:
+            raise ContextAccessDenied("taxonomy proposal is unavailable")
+        return TaxonomyProposal.model_validate_json(raw)
+
+    def record_taxonomy_security_review(
+        self, actor: str, review: TaxonomySecurityReview,
+    ) -> TaxonomySecurityReview:
+        proposal = self._taxonomy_proposal(actor, review.proposal_id)
+        if proposal.proposed_level != "security-domain":
+            raise ValueError("security review applies only to security-domain proposals")
+        with self.engine.begin() as conn:
+            conn.execute(text("""INSERT INTO taxonomy_security_reviews
+                (review_id, owner_person_id, proposal_id, decision, review_json, reviewed_at)
+                VALUES (:id, :owner, :proposal, :decision, :payload, :at)"""), {
+                "id": review.review_id, "owner": actor, "proposal": review.proposal_id,
+                "decision": review.decision, "payload": review.model_dump_json(),
+                "at": review.reviewed_at.isoformat(),
+            })
+        self._audit(actor, f"taxonomy.security-review.{review.decision}", "taxonomy-evolution",
+                    detail={"proposal_id": review.proposal_id, "policy_version": review.policy_version})
+        return review
+
+    def _approved_security_review(self, actor: str, proposal_id: str) -> bool:
+        with self.engine.connect() as conn:
+            decision = conn.execute(text("""SELECT decision FROM taxonomy_security_reviews
+                WHERE owner_person_id=:owner AND proposal_id=:proposal
+                ORDER BY reviewed_at DESC LIMIT 1"""),
+                {"owner": actor, "proposal": proposal_id}).scalar()
+        return decision == "approve"
+
     def decide_taxonomy_proposal(
         self, actor: str, decision: TaxonomyDecision,
     ) -> TaxonomyActivationReceipt | None:
@@ -281,6 +374,12 @@ class GovernedContextRepository:
         if not raw:
             raise ContextAccessDenied("taxonomy proposal is unavailable")
         proposal = TaxonomyProposal.model_validate_json(raw)
+        if (
+            decision.decision == "approve"
+            and proposal.proposed_level == "security-domain"
+            and not self._approved_security_review(actor, proposal.proposal_id)
+        ):
+            raise ValueError("approved security review is required before security-domain activation")
         new_status = {"approve": "approved", "decline": "declined", "defer": "deferred"}[decision.decision]
         cooldown_until = None
         if decision.decision in {"decline", "defer"}:
@@ -322,6 +421,162 @@ class GovernedContextRepository:
         self._audit(actor, f"taxonomy.proposal.{new_status}", "taxonomy-evolution", detail={
             "proposal_id": proposal.proposal_id, "domain_id": proposal.candidate.domain_id,
         })
+        return receipt
+
+    def preview_taxonomy_migration(
+        self, actor: str, proposal_id: str, *, source_domain_ids: Iterable[str],
+        selected_record_ids: Iterable[str] = (),
+    ) -> TaxonomyMigrationPreview:
+        proposal = self._taxonomy_proposal(actor, proposal_id)
+        if proposal.status != "approved":
+            raise ValueError("taxonomy domain must be approved before migration preview")
+        source_domains = tuple(sorted(set(source_domain_ids)))
+        if not source_domains:
+            raise ValueError("migration preview requires source domains")
+        selected = tuple(sorted(set(selected_record_ids)))
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""SELECT record_id, revision, governance_json FROM memory_records
+                WHERE owner_person_id=:owner AND deletion_state='active' ORDER BY record_id"""),
+                {"owner": actor}).mappings().all()
+        candidates = []
+        for row in rows:
+            governance = MemoryGovernance.model_validate(_loads(row["governance_json"], {}))
+            if set(governance.data_domains).intersection(source_domains):
+                candidates.append(row)
+        if selected:
+            candidates = [row for row in candidates if row["record_id"] in selected]
+            if {row["record_id"] for row in candidates} != set(selected):
+                raise ContextAccessDenied("selected migration record is unavailable")
+        if not candidates:
+            raise ValueError("migration preview has no eligible records")
+        record_revisions = {str(row["record_id"]): int(row["revision"]) for row in candidates}
+        preview_id = str(uuid4())
+        created = _now()
+        digest = taxonomy_preview_digest({
+            "preview_id": preview_id, "proposal_id": proposal_id,
+            "domain_id": proposal.candidate.domain_id, "source_domain_ids": source_domains,
+            "record_revisions": record_revisions,
+        })
+        preview = TaxonomyMigrationPreview(
+            preview_id=preview_id, proposal_id=proposal_id, domain_id=proposal.candidate.domain_id,
+            source_domain_ids=source_domains, record_revisions=record_revisions,
+            classification_change=f"Add {proposal.candidate.display_name} to {len(candidates)} selected record(s).",
+            key_boundary_change=("Set the logical key domain to the new security domain."
+                                 if proposal.proposed_level == "security-domain"
+                                 else "No key-domain change."),
+            created_at=created, expires_at=created + timedelta(minutes=15), confirmation_digest=digest,
+        )
+        with self.engine.begin() as conn:
+            conn.execute(text("""INSERT INTO taxonomy_migration_previews
+                (preview_id, owner_person_id, proposal_id, preview_json, expires_at, state)
+                VALUES (:id, :owner, :proposal, :payload, :expires, 'pending')"""), {
+                "id": preview.preview_id, "owner": actor, "proposal": proposal_id,
+                "payload": preview.model_dump_json(), "expires": preview.expires_at.isoformat(),
+            })
+        return preview
+
+    def execute_taxonomy_migration(
+        self, actor: str, command: TaxonomyMigrationCommand,
+    ) -> TaxonomyMigrationReceipt:
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""SELECT preview_json, state FROM taxonomy_migration_previews
+                WHERE preview_id=:id AND owner_person_id=:owner"""),
+                {"id": command.preview_id, "owner": actor}).mappings().fetchone()
+        if not row or row["state"] != "pending":
+            raise ContextAccessDenied("migration preview is unavailable")
+        preview = TaxonomyMigrationPreview.model_validate_json(row["preview_json"])
+        if preview.expires_at <= _now() or command.confirmation_digest != preview.confirmation_digest:
+            raise ValueError("migration preview is expired or has changed")
+        proposal = self._taxonomy_proposal(actor, preview.proposal_id)
+        security = proposal.proposed_level == "security-domain"
+        records = [self.get_memory(actor, record_id) for record_id in preview.record_revisions]
+        if any(record.revision != preview.record_revisions[record.record_id] for record in records):
+            raise ValueError("migration preview is stale")
+        migration_id = str(uuid4())
+        completed = _now()
+        receipt = TaxonomyMigrationReceipt(
+            migration_id=migration_id, preview_id=preview.preview_id,
+            proposal_id=preview.proposal_id, domain_id=preview.domain_id,
+            migrated_record_ids=tuple(preview.record_revisions),
+            rollback_until=completed + timedelta(days=30), completed_at=completed,
+        )
+        with self.engine.begin() as conn:
+            for record in records:
+                prior = record.governance
+                domains = tuple(dict.fromkeys((*prior.data_domains, preview.domain_id)))
+                updated = prior.model_copy(update={
+                    "data_domains": domains,
+                    "key_domain": preview.domain_id if security else prior.key_domain,
+                })
+                conn.execute(text("""INSERT INTO taxonomy_migration_items
+                    (migration_id, record_id, prior_governance_json, prior_revision)
+                    VALUES (:migration, :record, :governance, :revision)"""), {
+                    "migration": migration_id, "record": record.record_id,
+                    "governance": prior.model_dump_json(), "revision": record.revision,
+                })
+                conn.execute(text("""INSERT INTO memory_record_history
+                    (history_id, record_id, revision, snapshot_json, changed_by, reason, changed_at)
+                    VALUES (:id, :record, :revision, :snapshot, :actor, :reason, :at)"""), {
+                    "id": str(uuid4()), "record": record.record_id, "revision": record.revision,
+                    "snapshot": record.model_dump_json(), "actor": actor,
+                    "reason": f"taxonomy migration:{migration_id}", "at": completed.isoformat(),
+                })
+                conn.execute(text("""UPDATE memory_records SET governance_json=:governance,
+                    revision=revision+1, updated_at=:at WHERE record_id=:record"""), {
+                    "governance": updated.model_dump_json(), "at": completed.isoformat(),
+                    "record": record.record_id,
+                })
+            conn.execute(text("""INSERT INTO taxonomy_migrations
+                (migration_id, owner_person_id, proposal_id, receipt_json, status, rollback_until)
+                VALUES (:id, :owner, :proposal, :payload, 'complete', :until)"""), {
+                "id": migration_id, "owner": actor, "proposal": preview.proposal_id,
+                "payload": receipt.model_dump_json(), "until": receipt.rollback_until.isoformat(),
+            })
+            conn.execute(text("UPDATE taxonomy_migration_previews SET state='executed' WHERE preview_id=:id"),
+                         {"id": preview.preview_id})
+        for record in records:
+            self.invalidate_record_views(record.record_id, "key-rotation" if security else "correction")
+        self._audit(actor, "taxonomy.migration.completed", "taxonomy-evolution",
+                    detail={"migration_id": migration_id, "record_count": len(records)})
+        return receipt
+
+    def rollback_taxonomy_migration(self, actor: str, migration_id: str) -> TaxonomyRollbackReceipt:
+        with self.engine.connect() as conn:
+            migration = conn.execute(text("""SELECT status, rollback_until FROM taxonomy_migrations
+                WHERE migration_id=:id AND owner_person_id=:owner"""),
+                {"id": migration_id, "owner": actor}).mappings().fetchone()
+            items = conn.execute(text("""SELECT record_id, prior_governance_json FROM taxonomy_migration_items
+                WHERE migration_id=:id ORDER BY record_id"""), {"id": migration_id}).mappings().all()
+        if not migration or migration["status"] != "complete":
+            raise ContextAccessDenied("taxonomy migration is unavailable")
+        if datetime.fromisoformat(str(migration["rollback_until"])) <= _now():
+            raise ValueError("taxonomy migration rollback window has closed")
+        rolled_back = _now()
+        receipt = TaxonomyRollbackReceipt(
+            rollback_id=str(uuid4()), migration_id=migration_id,
+            restored_record_ids=tuple(str(item["record_id"]) for item in items),
+            rolled_back_at=rolled_back,
+        )
+        with self.engine.begin() as conn:
+            for item in items:
+                conn.execute(text("""UPDATE memory_records SET governance_json=:governance,
+                    revision=revision+1, updated_at=:at
+                    WHERE record_id=:record AND owner_person_id=:owner"""), {
+                    "governance": item["prior_governance_json"], "at": rolled_back.isoformat(),
+                    "record": item["record_id"], "owner": actor,
+                })
+            conn.execute(text("UPDATE taxonomy_migrations SET status='rolled-back' WHERE migration_id=:id"),
+                         {"id": migration_id})
+            conn.execute(text("""INSERT INTO taxonomy_rollback_receipts
+                (rollback_id, owner_person_id, migration_id, receipt_json, rolled_back_at)
+                VALUES (:id, :owner, :migration, :payload, :at)"""), {
+                "id": receipt.rollback_id, "owner": actor, "migration": migration_id,
+                "payload": receipt.model_dump_json(), "at": rolled_back.isoformat(),
+            })
+        for item in items:
+            self.invalidate_record_views(str(item["record_id"]), "key-rotation")
+        self._audit(actor, "taxonomy.migration.rolled-back", "taxonomy-evolution",
+                    detail={"migration_id": migration_id, "record_count": len(items)})
         return receipt
 
     def _audit(

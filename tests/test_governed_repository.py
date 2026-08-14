@@ -8,7 +8,7 @@ from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryK
 from unison_common.household import HouseholdCoordinationRequest
 from unison_common.governed_memory import (
     AlgorithmProvenance, DataDomainDefinition, DerivedViewDescriptor, MemoryRetrievalRequest,
-    TaxonomyDecision, TaxonomyUsageSignal,
+    TaxonomyDecision, TaxonomyMigrationCommand, TaxonomySecurityReview, TaxonomyUsageSignal,
 )
 
 
@@ -319,6 +319,12 @@ def test_usage_evidence_proposes_but_never_activates_without_person_approval(rep
     assert repo.list_taxonomy_domains("alice") == []
     assert repo.list_taxonomy_proposals("bob") == []
 
+    repo.record_taxonomy_security_review("alice", TaxonomySecurityReview(
+        review_id="review-existing-legal", proposal_id=proposal.proposal_id, decision="approve",
+        policy_version="taxonomy-policy.v1", separate_key_boundary=True,
+        retention_reviewed=True, sharing_reviewed=True, disclosure_reviewed=True,
+        rationale="Synthetic full-boundary review.",
+    ))
     receipt = repo.decide_taxonomy_proposal("alice", TaxonomyDecision(
         decision_id="decision-legal", proposal_id=proposal.proposal_id,
         decision="approve", explicit_confirmation=True, migration_scope="none",
@@ -349,3 +355,79 @@ def test_taxonomy_threshold_and_decline_cooldown_prevent_prompt_fatigue(repo):
         decision_id="decline-projects", proposal_id=proposal.proposal_id, decision="decline",
     ))
     assert repo.evaluate_taxonomy_candidate("alice", candidate, "subdomain") is None
+
+
+def _security_proposal(repo):
+    candidate = DataDomainDefinition(
+        domain_id="legal", display_name="Legal", description="Legal matters", origin="usage",
+    )
+    for index, day in enumerate((10, 10, 11)):
+        repo.observe_taxonomy_usage("alice", TaxonomyUsageSignal(
+            signal_id=f"security-{index}", candidate_domain_id="legal",
+            signal_type="policy-friction", suggested_level="security-domain",
+            observed_at=datetime(2026, 8, day, index, tzinfo=timezone.utc),
+        ))
+    return repo.evaluate_taxonomy_candidate("alice", candidate, "security-domain")
+
+
+def test_natural_preview_and_security_review_gate_activation(repo):
+    proposal = _security_proposal(repo)
+    preview = repo.taxonomy_proposal_preview("alice", proposal.proposal_id)
+    assert "Would you like that?" in preview.prompt
+    assert preview.requires_security_review is True
+    assert any("No records move" in item for item in preview.would_not_change)
+    decision = TaxonomyDecision(
+        decision_id="approve-legal", proposal_id=proposal.proposal_id,
+        decision="approve", explicit_confirmation=True,
+    )
+    with pytest.raises(ValueError, match="security review"):
+        repo.decide_taxonomy_proposal("alice", decision)
+    repo.record_taxonomy_security_review("alice", TaxonomySecurityReview(
+        review_id="review-legal", proposal_id=proposal.proposal_id, decision="approve",
+        policy_version="taxonomy-policy.v1", separate_key_boundary=True,
+        retention_reviewed=True, sharing_reviewed=True, disclosure_reviewed=True,
+        rationale="Separate legal material while preserving deny-by-default sharing.",
+    ))
+    assert repo.decide_taxonomy_proposal("alice", decision).domain.status == "active"
+
+
+def test_migration_preview_confirmation_staleness_and_rollback(repo):
+    private, _ = _people(repo)
+    record = repo.admit_memory(
+        "alice", space_id=private.space_id, kind=MemoryKind.ASSERTED_FACT,
+        content={"synthetic": "document"}, provenance="synthetic",
+        governance=MemoryGovernance(data_domains=("core-private",), key_domain="core-private"),
+    )
+    proposal = _security_proposal(repo)
+    repo.record_taxonomy_security_review("alice", TaxonomySecurityReview(
+        review_id="review-migration", proposal_id=proposal.proposal_id, decision="approve",
+        policy_version="taxonomy-policy.v1", separate_key_boundary=True,
+        retention_reviewed=True, sharing_reviewed=True, disclosure_reviewed=True,
+        rationale="Approved controls.",
+    ))
+    repo.decide_taxonomy_proposal("alice", TaxonomyDecision(
+        decision_id="approve-migration", proposal_id=proposal.proposal_id,
+        decision="approve", explicit_confirmation=True,
+    ))
+    preview = repo.preview_taxonomy_migration(
+        "alice", proposal.proposal_id, source_domain_ids=("core-private",),
+        selected_record_ids=(record.record_id,),
+    )
+    assert preview.record_revisions == {record.record_id: 1}
+    with pytest.raises(ValueError, match="expired or has changed"):
+        repo.execute_taxonomy_migration("alice", TaxonomyMigrationCommand(
+            preview_id=preview.preview_id, confirmation_digest="wrong",
+            explicit_confirmation=True,
+        ))
+    receipt = repo.execute_taxonomy_migration("alice", TaxonomyMigrationCommand(
+        preview_id=preview.preview_id, confirmation_digest=preview.confirmation_digest,
+        explicit_confirmation=True,
+    ))
+    migrated = repo.get_memory("alice", record.record_id)
+    assert migrated.governance.key_domain == "legal"
+    assert "legal" in migrated.governance.data_domains
+    rollback = repo.rollback_taxonomy_migration("alice", receipt.migration_id)
+    assert rollback.restored_record_ids == (record.record_id,)
+    restored = repo.get_memory("alice", record.record_id)
+    assert restored.governance.key_domain == "core-private"
+    assert restored.governance.data_domains == ("core-private",)

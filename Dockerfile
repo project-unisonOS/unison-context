@@ -1,6 +1,6 @@
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS common_wheel
 
-ARG UNISON_COMMON_REF="024b6fe4c5f6ba93025c98f212ad9a61ac8f344b"
+ARG UNISON_COMMON_REF="de477ae8f7322680a3e983156323b474306da6eb"
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

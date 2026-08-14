@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 
@@ -105,3 +107,52 @@ def test_governed_memory_api_filters_domains_and_returns_invalidation_receipts(t
         f"/v2/memory/{health['record_id']}/invalidation-receipts", params={"person_id": "alice"},
     ).json()["receipts"]
     assert [(item["view_id"], item["reason"]) for item in receipts] == [("embedding-api-1", "correction")]
+
+
+def test_taxonomy_review_migration_and_rollback_api(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNISON_PRINCIPAL_BINDING_TEST_BYPASS", "true")
+    server._GOVERNED = GovernedContextRepository(create_engine(f"sqlite:///{tmp_path / 'taxonomy.db'}", future=True))
+    client = TestClient(server.app)
+    private = client.post("/v2/spaces/private", json={"person_id": "alice"}).json()["space"]
+    record = client.post("/v2/memory", json={
+        "person_id": "alice", "space_id": private["space_id"], "kind": "asserted_fact",
+        "content": {"synthetic": "legal-document"}, "provenance": "synthetic",
+    }).json()["record"]
+    for index, day in enumerate((10, 10, 11)):
+        client.post("/v2/taxonomy/signals", json={
+            "person_id": "alice", "signal_id": f"api-{index}", "candidate_domain_id": "legal",
+            "signal_type": "policy-friction", "suggested_level": "security-domain",
+            "observed_at": datetime(2026, 8, day, index, tzinfo=timezone.utc).isoformat(),
+        }).raise_for_status()
+    proposal = client.post("/v2/taxonomy/proposals/evaluate", json={
+        "person_id": "alice", "proposed_level": "security-domain",
+        "candidate": {"domain_id": "legal", "display_name": "Legal", "description": "Legal matters", "origin": "usage"},
+    }).json()["proposal"]
+    preview = client.get(
+        f"/v2/taxonomy/proposals/{proposal['proposal_id']}/preview", params={"person_id": "alice"},
+    ).json()["preview"]
+    assert preview["requires_security_review"] is True
+    client.post(f"/v2/taxonomy/proposals/{proposal['proposal_id']}/security-review", json={
+        "person_id": "alice", "review_id": "api-review", "decision": "approve",
+        "policy_version": "taxonomy-policy.v1", "separate_key_boundary": True,
+        "retention_reviewed": True, "sharing_reviewed": True, "disclosure_reviewed": True,
+        "rationale": "Synthetic complete review",
+    }).raise_for_status()
+    client.post(f"/v2/taxonomy/proposals/{proposal['proposal_id']}/decision", json={
+        "person_id": "alice", "decision_id": "api-decision", "decision": "approve",
+        "explicit_confirmation": True,
+    }).raise_for_status()
+    migration_preview = client.post(
+        f"/v2/taxonomy/proposals/{proposal['proposal_id']}/migration-preview", json={
+            "person_id": "alice", "source_domain_ids": ["core-private"],
+            "selected_record_ids": [record["record_id"]],
+        },
+    ).json()["preview"]
+    receipt = client.post("/v2/taxonomy/migrations", json={
+        "person_id": "alice", "preview_id": migration_preview["preview_id"],
+        "confirmation_digest": migration_preview["confirmation_digest"], "explicit_confirmation": True,
+    }).json()["receipt"]
+    rollback = client.post(
+        f"/v2/taxonomy/migrations/{receipt['migration_id']}/rollback", json={"person_id": "alice"},
+    )
+    assert rollback.json()["receipt"]["restored_record_ids"] == [record["record_id"]]
