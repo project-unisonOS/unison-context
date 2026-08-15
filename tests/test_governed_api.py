@@ -1,10 +1,13 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 
 import server
 from governed_repository import GovernedContextRepository
+from unison_common.governed_memory import SignedTaxonomyPolicyIssuance, TaxonomySecurityReview
+from unison_common.trust import LocalDevelopmentKeyBroker
 
 
 def test_governed_api_explicit_share_and_non_oracular_denial(tmp_path, monkeypatch):
@@ -111,7 +114,11 @@ def test_governed_memory_api_filters_domains_and_returns_invalidation_receipts(t
 
 def test_taxonomy_review_migration_and_rollback_api(tmp_path, monkeypatch):
     monkeypatch.setenv("UNISON_PRINCIPAL_BINDING_TEST_BYPASS", "true")
-    server._GOVERNED = GovernedContextRepository(create_engine(f"sqlite:///{tmp_path / 'taxonomy.db'}", future=True))
+    policy_key = Ed25519PrivateKey.generate()
+    server._GOVERNED = GovernedContextRepository(
+        create_engine(f"sqlite:///{tmp_path / 'taxonomy.db'}", future=True),
+        key_broker=LocalDevelopmentKeyBroker(b"api-test-root-secret-for-context-32"),
+        taxonomy_policy_public_key=policy_key.public_key())
     client = TestClient(server.app)
     private = client.post("/v2/spaces/private", json={"person_id": "alice"}).json()["space"]
     record = client.post("/v2/memory", json={
@@ -132,11 +139,16 @@ def test_taxonomy_review_migration_and_rollback_api(tmp_path, monkeypatch):
         f"/v2/taxonomy/proposals/{proposal['proposal_id']}/preview", params={"person_id": "alice"},
     ).json()["preview"]
     assert preview["requires_security_review"] is True
+    review = TaxonomySecurityReview(review_id="api-review", proposal_id=proposal["proposal_id"],
+        decision="approve", policy_version="taxonomy-policy.v1", separate_key_boundary=True,
+        retention_reviewed=True, sharing_reviewed=True, disclosure_reviewed=True,
+        rationale="Synthetic complete review")
+    now = datetime.now(timezone.utc)
+    issuance = SignedTaxonomyPolicyIssuance(issuance_id="api-issuance", owner_person_id="alice",
+        proposal_id=proposal["proposal_id"], review=review, issued_at=now,
+        expires_at=now + timedelta(minutes=5), key_id="test-policy").sign(policy_key)
     client.post(f"/v2/taxonomy/proposals/{proposal['proposal_id']}/security-review", json={
-        "person_id": "alice", "review_id": "api-review", "decision": "approve",
-        "policy_version": "taxonomy-policy.v1", "separate_key_boundary": True,
-        "retention_reviewed": True, "sharing_reviewed": True, "disclosure_reviewed": True,
-        "rationale": "Synthetic complete review",
+        "person_id": "alice", "issuance": issuance.model_dump(mode="json"),
     }).raise_for_status()
     client.post(f"/v2/taxonomy/proposals/{proposal['proposal_id']}/decision", json={
         "person_id": "alice", "decision_id": "api-decision", "decision": "approve",

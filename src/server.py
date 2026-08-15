@@ -9,6 +9,7 @@ import os
 from datetime import datetime
 from base64 import urlsafe_b64decode
 from pathlib import Path
+from cryptography.hazmat.primitives import serialization
 from typing import Dict, Any, List, Optional
 from urllib.parse import quote
 from unison_common.logging import configure_logging, log_json
@@ -44,7 +45,7 @@ from unison_common import SituationalOverride
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
 from unison_common.governed_memory import (
     AlgorithmProvenance, DataDomainDefinition, DerivedViewDescriptor, MemoryRetrievalRequest,
-    TaxonomyDecision, TaxonomyMigrationCommand, TaxonomySecurityReview,
+    TaxonomyDecision, TaxonomyMigrationCommand, SignedTaxonomyPolicyIssuance,
     TaxonomyUsageSignal,
 )
 from unison_common.household import HouseholdCoordinationRequest
@@ -182,7 +183,12 @@ def _init_db():
     with _ENGINE.begin() as conn:
         for ddl in ddl_statements:
             conn.execute(text(ddl))
-    _GOVERNED = GovernedContextRepository(_ENGINE)
+    policy_key = None
+    policy_key_path = os.getenv("UNISON_TAXONOMY_POLICY_PUBLIC_KEY_FILE", "").strip()
+    if policy_key_path:
+        policy_key = serialization.load_pem_public_key(Path(policy_key_path).read_bytes())
+    _GOVERNED = GovernedContextRepository(_ENGINE, key_broker=_KEY_BROKER,
+                                           taxonomy_policy_public_key=policy_key)
     _INTERACTION_PROFILES = InteractionProfileRepository(_ENGINE)
 
 
@@ -1186,10 +1192,10 @@ def governed_taxonomy_preview(proposal_id: str, request: Request, person_id: str
 def governed_taxonomy_security_review(proposal_id: str, request: Request, body: Dict[str, Any] = Body(...)):
     actor, _ = _governed_actor(request, body.get("person_id"))
     try:
-        value = dict(body)
-        value.pop("person_id", None)
+        value = dict(body.get("issuance") or {})
         value["proposal_id"] = proposal_id
-        review = _repo().record_taxonomy_security_review(actor, TaxonomySecurityReview.model_validate(value))
+        review = _repo().accept_taxonomy_policy_issuance(
+            actor, SignedTaxonomyPolicyIssuance.model_validate(value))
         return {"review": review.model_dump(mode="json")}
     except Exception as exc:
         raise _context_error(exc) from exc
@@ -1248,7 +1254,8 @@ def governed_begin_embedding_migration(request: Request, body: Dict[str, Any] = 
 def governed_claim_rebuild_jobs(request: Request, body: Dict[str, Any] = Body(...)):
     actor, _ = _governed_actor(request, body.get("person_id"))
     try:
-        jobs = _repo().claim_rebuild_jobs(actor, limit=int(body.get("limit", 10)))
+        jobs = _repo().claim_rebuild_jobs(actor, limit=int(body.get("limit", 10)),
+            worker_id=str(body["worker_id"]), lease_seconds=int(body.get("lease_seconds", 60)))
         return {"jobs": [job.model_dump(mode="json") for job in jobs]}
     except Exception as exc:
         raise _context_error(exc) from exc
@@ -1258,10 +1265,37 @@ def governed_claim_rebuild_jobs(request: Request, body: Dict[str, Any] = Body(..
 def governed_complete_rebuild_job(job_id: str, request: Request, body: Dict[str, Any] = Body(...)):
     actor, _ = _governed_actor(request, body.get("person_id"))
     try:
-        view = _repo().complete_rebuild_job(actor, job_id, view_id=str(body["view_id"]))
+        view = _repo().complete_rebuild_job(actor, job_id, view_id=str(body["view_id"]),
+                                            worker_id=str(body["worker_id"]))
         return {"view": view.model_dump(mode="json")}
     except Exception as exc:
         raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/rebuild-jobs/{job_id}/fail")
+def governed_fail_rebuild_job(job_id: str, request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        job = _repo().fail_rebuild_job(actor, job_id, worker_id=str(body["worker_id"]),
+            error=str(body.get("error", "worker failure")), retryable=bool(body.get("retryable", True)))
+        return {"job": job.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/rebuild-jobs/{job_id}/cancel")
+def governed_cancel_rebuild_job(job_id: str, request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        return {"job": _repo().cancel_rebuild_job(actor, job_id).model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.get("/v2/memory/rebuild-jobs/metrics")
+def governed_rebuild_metrics(request: Request, person_id: str | None = None):
+    actor, _ = _governed_actor(request, person_id)
+    return {"states": _repo().rebuild_metrics(actor)}
 
 
 @app.post("/v2/memory/embedding-migrations/{migration_id}/cutover")
