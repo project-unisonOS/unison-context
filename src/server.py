@@ -50,9 +50,10 @@ from unison_common.governed_memory import (
     TaxonomyUsageSignal,
 )
 from unison_common.household import HouseholdCoordinationRequest
-from unison_common.resolution import (CandidateTransition, DeterminizationCandidate,
-                                      ResolutionAttempt, ResolutionPilotSignal,
-                                      ResolutionReceipt)
+from unison_common.resolution import (CandidateCanaryRecord, CandidateTransition,
+                                      DeterminizationCandidate, HeadlessInteractionSession,
+                                      PilotEnrollment, PilotReviewDecision, ResolutionAttempt,
+                                      ResolutionPilotSignal, ResolutionReceipt)
 
 app = FastAPI(title="unison-context")
 app.add_middleware(TracingMiddleware, service_name="unison-context")
@@ -1338,6 +1339,49 @@ def create_resolution_pilot_signal(request: Request, body: Dict[str, Any] = Body
     return {"signal": signal.model_dump(mode="json")}
 
 
+@app.post("/v1/resolution/pilot-enrollment")
+def create_resolution_pilot_enrollment(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    value = dict(body["enrollment"]); value["owner_person_id"] = actor
+    enrollment = _resolution_repo().enroll_pilot(actor, PilotEnrollment.model_validate(value))
+    return {"enrollment": enrollment.model_dump(mode="json")}
+
+
+@app.post("/v1/resolution/pilot-enrollment/revoke")
+def revoke_resolution_pilot_enrollment(request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    return {"enrollment": _resolution_repo().revoke_pilot(actor).model_dump(mode="json")}
+
+
+@app.delete("/v1/resolution/pilot-data")
+def delete_resolution_pilot_data(request: Request, person_id: str | None = None):
+    actor, _ = _governed_actor(request, person_id)
+    return {"enrollment": _resolution_repo().delete_pilot_data(actor).model_dump(mode="json")}
+
+
+@app.post("/v1/resolution/pilot-reviews")
+def create_resolution_pilot_review(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    value = dict(body["review"]); value["owner_person_id"] = actor
+    review = _resolution_repo().record_pilot_review(actor, PilotReviewDecision.model_validate(value))
+    return {"review": review.model_dump(mode="json")}
+
+
+@app.post("/v1/resolution/headless-sessions")
+def create_headless_session(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    value = dict(body["session"]); value["owner_person_id"] = actor
+    session = _resolution_repo().put_headless_session(actor, HeadlessInteractionSession.model_validate(value))
+    return {"session": session.model_dump(mode="json")}
+
+
+@app.post("/v1/resolution/headless-sessions/{session_id}/resume")
+def resume_headless_session(session_id: str, request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    session = _resolution_repo().resume_headless_session(actor, session_id, body["reconnect_token_digest"])
+    return {"session": session.model_dump(mode="json")}
+
+
 @app.get("/v1/resolution/pilot-summary")
 def resolution_pilot_summary(request: Request, person_id: str | None = None):
     actor, _ = _governed_actor(request, person_id)
@@ -1356,6 +1400,14 @@ def transition_determinization_candidate(candidate_id: str, request: Request, bo
     actor, _ = _governed_actor(request, body.get("person_id"))
     value = dict(body["transition"]); value["candidate_id"] = candidate_id
     return {"candidate": _resolution_repo().transition(actor, CandidateTransition.model_validate(value)).model_dump(mode="json")}
+
+
+@app.post("/v1/determinization/candidates/{candidate_id}/canaries")
+def record_determinization_canary(candidate_id: str, request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    value = dict(body["canary"]); value["candidate_id"] = candidate_id; value["owner_person_id"] = actor
+    canary = _resolution_repo().record_canary(actor, CandidateCanaryRecord.model_validate(value))
+    return {"canary": canary.model_dump(mode="json")}
 
 
 @app.post("/v2/memory/embedding-migrations/{migration_id}/cutover")
