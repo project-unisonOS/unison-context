@@ -43,7 +43,7 @@ from interaction_profiles import InteractionProfileRepository
 from unison_common import SituationalOverride
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
 from unison_common.governed_memory import (
-    DataDomainDefinition, DerivedViewDescriptor, MemoryRetrievalRequest,
+    AlgorithmProvenance, DataDomainDefinition, DerivedViewDescriptor, MemoryRetrievalRequest,
     TaxonomyDecision, TaxonomyMigrationCommand, TaxonomySecurityReview,
     TaxonomyUsageSignal,
 )
@@ -1226,6 +1226,58 @@ def governed_taxonomy_rollback(migration_id: str, request: Request, body: Dict[s
     try:
         receipt = _repo().rollback_taxonomy_migration(actor, migration_id)
         return {"receipt": receipt.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/embedding-migrations")
+def governed_begin_embedding_migration(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        plan = _repo().begin_embedding_migration(
+            actor, source_algorithm_id=str(body["source_algorithm_id"]),
+            target_algorithm=AlgorithmProvenance.model_validate(body["target_algorithm"]),
+            source_namespace=str(body["source_namespace"]), target_namespace=str(body["target_namespace"]),
+        )
+        return {"migration": plan.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/rebuild-jobs/claim")
+def governed_claim_rebuild_jobs(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        jobs = _repo().claim_rebuild_jobs(actor, limit=int(body.get("limit", 10)))
+        return {"jobs": [job.model_dump(mode="json") for job in jobs]}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/rebuild-jobs/{job_id}/complete")
+def governed_complete_rebuild_job(job_id: str, request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        view = _repo().complete_rebuild_job(actor, job_id, view_id=str(body["view_id"]))
+        return {"view": view.model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/embedding-migrations/{migration_id}/cutover")
+def governed_cutover_embedding_migration(migration_id: str, request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        return {"migration": _repo().cutover_embedding_migration(actor, migration_id).model_dump(mode="json")}
+    except Exception as exc:
+        raise _context_error(exc) from exc
+
+
+@app.post("/v2/memory/embedding-migrations/{migration_id}/rollback")
+def governed_rollback_embedding_migration(migration_id: str, request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    try:
+        return {"migration": _repo().rollback_embedding_migration(actor, migration_id).model_dump(mode="json")}
     except Exception as exc:
         raise _context_error(exc) from exc
 

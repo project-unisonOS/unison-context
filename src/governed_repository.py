@@ -24,10 +24,13 @@ from unison_common.governed_context import (
     SpaceMembership,
 )
 from unison_common.governed_memory import (
+    AlgorithmProvenance,
     AuthorizedContextPacket,
     DataDomainDefinition,
     DerivedViewDescriptor,
     DerivedViewInvalidationReceipt,
+    DerivedViewRebuildJob,
+    EmbeddingMigrationPlan,
     MemoryRetrievalRequest,
     TaxonomyActivationReceipt,
     TaxonomyDecision,
@@ -151,6 +154,16 @@ class GovernedContextRepository:
                 receipt_id TEXT PRIMARY KEY, view_id TEXT NOT NULL,
                 source_record_id TEXT NOT NULL, receipt_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS derived_view_rebuild_jobs (
+                job_id TEXT PRIMARY KEY, owner_person_id TEXT NOT NULL,
+                migration_id TEXT, source_record_id TEXT NOT NULL,
+                state TEXT NOT NULL, attempts INTEGER NOT NULL,
+                job_json TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS embedding_index_migrations (
+                migration_id TEXT PRIMARY KEY, owner_person_id TEXT NOT NULL,
+                state TEXT NOT NULL, plan_json TEXT NOT NULL, created_at TEXT NOT NULL
             )""",
             """CREATE TABLE IF NOT EXISTS taxonomy_usage_signals (
                 signal_id TEXT NOT NULL, owner_person_id TEXT NOT NULL,
@@ -1090,6 +1103,150 @@ class GovernedContextRepository:
                 "descriptor": descriptor.model_dump_json(), "created": descriptor.created_at.isoformat(),
             })
         return descriptor
+
+    def begin_embedding_migration(
+        self, actor: str, *, source_algorithm_id: str, target_algorithm: AlgorithmProvenance,
+        source_namespace: str, target_namespace: str,
+    ) -> EmbeddingMigrationPlan:
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""SELECT v.descriptor_json, r.owner_person_id
+                FROM derived_memory_views v JOIN memory_records r ON r.record_id=v.source_record_id
+                WHERE v.state='active' AND r.owner_person_id=:owner"""), {"owner": actor}).mappings().all()
+        descriptors = [DerivedViewDescriptor.model_validate_json(row["descriptor_json"]) for row in rows]
+        sources = [item for item in descriptors if item.view_kind == "embedding"
+                   and item.algorithm.algorithm_id == source_algorithm_id
+                   and item.index_namespace == source_namespace]
+        migration_id = str(uuid4())
+        plan = EmbeddingMigrationPlan(
+            migration_id=migration_id, owner_person_id=actor,
+            source_algorithm=sources[0].algorithm if sources else target_algorithm,
+            target_algorithm=target_algorithm, source_namespace=source_namespace,
+            target_namespace=target_namespace, total_jobs=len(sources),
+            state="ready" if not sources else "rebuilding",
+        )
+        jobs = [DerivedViewRebuildJob(
+            job_id=str(uuid4()), owner_person_id=actor,
+            source_record_id=item.source_record_id, source_revision=item.source_revision,
+            view_kind="embedding", target_algorithm=target_algorithm,
+            target_namespace=target_namespace,
+        ) for item in sources]
+        with self.engine.begin() as conn:
+            conn.execute(text("""INSERT INTO embedding_index_migrations
+                (migration_id, owner_person_id, state, plan_json, created_at)
+                VALUES (:id, :owner, :state, :payload, :created)"""), {
+                "id": migration_id, "owner": actor, "state": plan.state,
+                "payload": plan.model_dump_json(), "created": plan.created_at.isoformat(),
+            })
+            for job in jobs:
+                conn.execute(text("""INSERT INTO derived_view_rebuild_jobs
+                    (job_id, owner_person_id, migration_id, source_record_id, state,
+                     attempts, job_json, created_at, completed_at)
+                    VALUES (:id, :owner, :migration, :record, 'pending', 0, :payload, :created, NULL)"""), {
+                    "id": job.job_id, "owner": actor, "migration": migration_id,
+                    "record": job.source_record_id, "payload": job.model_dump_json(),
+                    "created": job.created_at.isoformat(),
+                })
+        return plan
+
+    def claim_rebuild_jobs(self, actor: str, *, limit: int = 10) -> list[DerivedViewRebuildJob]:
+        if limit < 1 or limit > 100:
+            raise ValueError("rebuild claim limit must be between 1 and 100")
+        with self.engine.begin() as conn:
+            rows = conn.execute(text("""SELECT job_id, job_json FROM derived_view_rebuild_jobs
+                WHERE owner_person_id=:owner AND state='pending'
+                ORDER BY created_at, job_id LIMIT :limit"""), {"owner": actor, "limit": limit}).mappings().all()
+            jobs = []
+            for row in rows:
+                job = DerivedViewRebuildJob.model_validate_json(row["job_json"]).model_copy(
+                    update={"state": "running", "attempts": DerivedViewRebuildJob.model_validate_json(row["job_json"]).attempts + 1}
+                )
+                conn.execute(text("""UPDATE derived_view_rebuild_jobs SET state='running',
+                    attempts=:attempts, job_json=:payload WHERE job_id=:id AND state='pending'"""), {
+                    "attempts": job.attempts, "payload": job.model_dump_json(), "id": job.job_id,
+                })
+                jobs.append(job)
+        return jobs
+
+    def complete_rebuild_job(
+        self, actor: str, job_id: str, *, view_id: str,
+    ) -> DerivedViewDescriptor:
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""SELECT job_json, migration_id FROM derived_view_rebuild_jobs
+                WHERE job_id=:id AND owner_person_id=:owner AND state='running'"""),
+                {"id": job_id, "owner": actor}).mappings().fetchone()
+        if not row:
+            raise ContextAccessDenied("rebuild job is unavailable")
+        job = DerivedViewRebuildJob.model_validate_json(row["job_json"])
+        source = self.get_memory(actor, job.source_record_id)
+        if source.revision != job.source_revision:
+            raise ValueError("rebuild source revision changed")
+        descriptor = DerivedViewDescriptor(
+            view_id=view_id, view_kind=job.view_kind, source_record_id=source.record_id,
+            source_revision=source.revision, space_id=source.space_id,
+            data_domains=source.governance.data_domains, index_namespace=job.target_namespace,
+            algorithm=job.target_algorithm,
+        )
+        self.register_derived_view(actor, descriptor)
+        completed = job.model_copy(update={"state": "complete"})
+        with self.engine.begin() as conn:
+            conn.execute(text("""UPDATE derived_view_rebuild_jobs SET state='complete',
+                job_json=:payload, completed_at=:at WHERE job_id=:id"""), {
+                "payload": completed.model_dump_json(), "at": _iso(), "id": job_id,
+            })
+        if row["migration_id"]:
+            self._refresh_embedding_migration(actor, str(row["migration_id"]))
+        return descriptor
+
+    def _refresh_embedding_migration(self, actor: str, migration_id: str) -> EmbeddingMigrationPlan:
+        with self.engine.connect() as conn:
+            raw = conn.execute(text("""SELECT plan_json FROM embedding_index_migrations
+                WHERE migration_id=:id AND owner_person_id=:owner"""),
+                {"id": migration_id, "owner": actor}).scalar()
+            counts = conn.execute(text("""SELECT state, COUNT(*) AS count FROM derived_view_rebuild_jobs
+                WHERE migration_id=:id GROUP BY state"""), {"id": migration_id}).mappings().all()
+        if not raw:
+            raise ContextAccessDenied("embedding migration is unavailable")
+        plan = EmbeddingMigrationPlan.model_validate_json(raw)
+        by_state = {str(row["state"]): int(row["count"]) for row in counts}
+        complete = by_state.get("complete", 0)
+        state = "ready" if plan.state == "rebuilding" and complete == plan.total_jobs else plan.state
+        updated = plan.model_copy(update={"completed_jobs": complete, "state": state})
+        with self.engine.begin() as conn:
+            conn.execute(text("""UPDATE embedding_index_migrations SET state=:state, plan_json=:payload
+                WHERE migration_id=:id"""), {"state": state, "payload": updated.model_dump_json(), "id": migration_id})
+        return updated
+
+    def cutover_embedding_migration(self, actor: str, migration_id: str) -> EmbeddingMigrationPlan:
+        plan = self._refresh_embedding_migration(actor, migration_id)
+        if plan.state != "ready":
+            raise ValueError("embedding migration rebuild is incomplete")
+        with self.engine.begin() as conn:
+            conn.execute(text("""UPDATE derived_memory_views SET state='superseded'
+                WHERE state='active' AND descriptor_json LIKE :namespace
+                  AND source_record_id IN (SELECT record_id FROM memory_records WHERE owner_person_id=:owner)"""),
+                {"namespace": f'%"index_namespace":"{plan.source_namespace}"%', "owner": actor})
+            updated = plan.model_copy(update={"state": "cutover"})
+            conn.execute(text("""UPDATE embedding_index_migrations SET state='cutover', plan_json=:payload
+                WHERE migration_id=:id"""), {"payload": updated.model_dump_json(), "id": migration_id})
+        return updated
+
+    def rollback_embedding_migration(self, actor: str, migration_id: str) -> EmbeddingMigrationPlan:
+        plan = self._refresh_embedding_migration(actor, migration_id)
+        if plan.state != "cutover":
+            raise ValueError("only a completed cutover can be rolled back")
+        with self.engine.begin() as conn:
+            conn.execute(text("""UPDATE derived_memory_views SET state='invalidated', invalidated_at=:at
+                WHERE state='active' AND descriptor_json LIKE :namespace
+                  AND source_record_id IN (SELECT record_id FROM memory_records WHERE owner_person_id=:owner)"""),
+                {"at": _iso(), "namespace": f'%"index_namespace":"{plan.target_namespace}"%', "owner": actor})
+            conn.execute(text("""UPDATE derived_memory_views SET state='active'
+                WHERE state='superseded' AND descriptor_json LIKE :namespace
+                  AND source_record_id IN (SELECT record_id FROM memory_records WHERE owner_person_id=:owner)"""),
+                {"namespace": f'%"index_namespace":"{plan.source_namespace}"%', "owner": actor})
+            updated = plan.model_copy(update={"state": "rolled-back"})
+            conn.execute(text("""UPDATE embedding_index_migrations SET state='rolled-back', plan_json=:payload
+                WHERE migration_id=:id"""), {"payload": updated.model_dump_json(), "id": migration_id})
+        return updated
 
     def _invalidate_views(self, where: str, params: dict[str, Any], reason: str) -> list[DerivedViewInvalidationReceipt]:
         with self.engine.connect() as conn:
