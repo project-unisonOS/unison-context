@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 from uuid import uuid4
 
 from sqlalchemy import Engine, bindparam, inspect, text
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from unison_common.governed_context import (
     Commitment,
@@ -40,6 +42,7 @@ from unison_common.governed_memory import (
     TaxonomyProposal,
     TaxonomyProposalPreview,
     TaxonomyRollbackReceipt,
+    SignedTaxonomyPolicyIssuance,
     TaxonomySecurityReview,
     TaxonomyUsageSignal,
     taxonomy_preview_digest,
@@ -54,6 +57,7 @@ from unison_common.household import (
     SharePreview,
     SharedFact,
 )
+from unison_common.trust import KeyBroker
 
 
 class ContextAccessDenied(RuntimeError):
@@ -79,8 +83,11 @@ def _loads(value: str | None, default: Any) -> Any:
 class GovernedContextRepository:
     """Authoritative local repository. Relationship edges never grant access."""
 
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, key_broker: KeyBroker | None = None,
+                 taxonomy_policy_public_key: Ed25519PublicKey | None = None):
         self.engine = engine
+        self.key_broker = key_broker
+        self.taxonomy_policy_public_key = taxonomy_policy_public_key
         self.migrate()
 
     def migrate(self) -> None:
@@ -193,7 +200,7 @@ class GovernedContextRepository:
             """CREATE TABLE IF NOT EXISTS taxonomy_security_reviews (
                 review_id TEXT NOT NULL, owner_person_id TEXT NOT NULL,
                 proposal_id TEXT NOT NULL, decision TEXT NOT NULL,
-                review_json TEXT NOT NULL, reviewed_at TEXT NOT NULL,
+                review_json TEXT NOT NULL, reviewed_at TEXT NOT NULL, service_authenticated INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (owner_person_id, review_id)
             )""",
             """CREATE TABLE IF NOT EXISTS taxonomy_migration_previews (
@@ -234,6 +241,16 @@ class GovernedContextRepository:
         if "household_id" not in columns:
             with self.engine.begin() as conn:
                 conn.execute(text("ALTER TABLE context_spaces ADD COLUMN household_id TEXT"))
+        memory_columns = {column["name"] for column in inspect(self.engine).get_columns("memory_records")}
+        with self.engine.begin() as conn:
+            if "content_ciphertext" not in memory_columns:
+                conn.execute(text("ALTER TABLE memory_records ADD COLUMN content_ciphertext TEXT"))
+            if "content_key_handle" not in memory_columns:
+                conn.execute(text("ALTER TABLE memory_records ADD COLUMN content_key_handle TEXT"))
+        review_columns = {column["name"] for column in inspect(self.engine).get_columns("taxonomy_security_reviews")}
+        if "service_authenticated" not in review_columns:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE taxonomy_security_reviews ADD COLUMN service_authenticated INTEGER NOT NULL DEFAULT 0"))
 
     def observe_taxonomy_usage(self, actor: str, signal: TaxonomyUsageSignal) -> TaxonomyUsageSignal:
         """Persist structured evidence only; raw request or memory content is not accepted."""
@@ -352,27 +369,44 @@ class GovernedContextRepository:
         return TaxonomyProposal.model_validate_json(raw)
 
     def record_taxonomy_security_review(
-        self, actor: str, review: TaxonomySecurityReview,
+        self, actor: str, review: TaxonomySecurityReview, *, service_authenticated: bool = False,
     ) -> TaxonomySecurityReview:
         proposal = self._taxonomy_proposal(actor, review.proposal_id)
         if proposal.proposed_level != "security-domain":
             raise ValueError("security review applies only to security-domain proposals")
         with self.engine.begin() as conn:
             conn.execute(text("""INSERT INTO taxonomy_security_reviews
-                (review_id, owner_person_id, proposal_id, decision, review_json, reviewed_at)
-                VALUES (:id, :owner, :proposal, :decision, :payload, :at)"""), {
+                (review_id, owner_person_id, proposal_id, decision, review_json, reviewed_at, service_authenticated)
+                VALUES (:id, :owner, :proposal, :decision, :payload, :at, :authenticated)"""), {
                 "id": review.review_id, "owner": actor, "proposal": review.proposal_id,
                 "decision": review.decision, "payload": review.model_dump_json(),
-                "at": review.reviewed_at.isoformat(),
+                "at": review.reviewed_at.isoformat(), "authenticated": 1 if service_authenticated else 0,
             })
         self._audit(actor, f"taxonomy.security-review.{review.decision}", "taxonomy-evolution",
                     detail={"proposal_id": review.proposal_id, "policy_version": review.policy_version})
         return review
 
+    def accept_taxonomy_policy_issuance(
+        self, actor: str, issuance: SignedTaxonomyPolicyIssuance,
+    ) -> TaxonomySecurityReview:
+        if self.taxonomy_policy_public_key is None:
+            raise ContextAccessDenied("taxonomy policy verification key is not configured")
+        proposal = self._taxonomy_proposal(actor, issuance.proposal_id)
+        if proposal.proposed_level != "security-domain":
+            raise ValueError("policy issuance applies only to security-domain proposals")
+        review = issuance.verify(self.taxonomy_policy_public_key,
+                                 owner_person_id=actor, proposal_id=proposal.proposal_id)
+        result = self.record_taxonomy_security_review(actor, review, service_authenticated=True)
+        self._audit(actor, "taxonomy.policy-issuance.accepted", "taxonomy-evolution",
+                    detail={"proposal_id": proposal.proposal_id, "issuance_id": issuance.issuance_id,
+                            "key_id": issuance.key_id})
+        return result
+
     def _approved_security_review(self, actor: str, proposal_id: str) -> bool:
         with self.engine.connect() as conn:
             decision = conn.execute(text("""SELECT decision FROM taxonomy_security_reviews
                 WHERE owner_person_id=:owner AND proposal_id=:proposal
+                  AND service_authenticated=1
                 ORDER BY reviewed_at DESC LIMIT 1"""),
                 {"owner": actor, "proposal": proposal_id}).scalar()
         return decision == "approve"
@@ -502,6 +536,8 @@ class GovernedContextRepository:
             raise ValueError("migration preview is expired or has changed")
         proposal = self._taxonomy_proposal(actor, preview.proposal_id)
         security = proposal.proposed_level == "security-domain"
+        if security and self.key_broker is None:
+            raise ValueError("security-domain migration requires a configured key broker")
         records = [self.get_memory(actor, record_id) for record_id in preview.record_revisions]
         if any(record.revision != preview.record_revisions[record.record_id] for record in records):
             raise ValueError("migration preview is stale")
@@ -521,6 +557,15 @@ class GovernedContextRepository:
                     "data_domains": domains,
                     "key_domain": preview.domain_id if security else prior.key_domain,
                 })
+                encrypted = None
+                key_handle = None
+                if security:
+                    key_handle = f"memory:{actor}:{preview.domain_id}"
+                    encrypted = base64.b64encode(self.key_broker.encrypt(
+                        key_handle=key_handle,
+                        plaintext=json.dumps(record.content, sort_keys=True).encode(),
+                        associated_data=record.record_id.encode(),
+                    )).decode()
                 conn.execute(text("""INSERT INTO taxonomy_migration_items
                     (migration_id, record_id, prior_governance_json, prior_revision)
                     VALUES (:migration, :record, :governance, :revision)"""), {
@@ -535,9 +580,12 @@ class GovernedContextRepository:
                     "reason": f"taxonomy migration:{migration_id}", "at": completed.isoformat(),
                 })
                 conn.execute(text("""UPDATE memory_records SET governance_json=:governance,
+                    content_json=CASE WHEN :encrypted IS NULL THEN content_json ELSE '{}' END,
+                    content_ciphertext=COALESCE(:encrypted, content_ciphertext),
+                    content_key_handle=COALESCE(:key_handle, content_key_handle),
                     revision=revision+1, updated_at=:at WHERE record_id=:record"""), {
                     "governance": updated.model_dump_json(), "at": completed.isoformat(),
-                    "record": record.record_id,
+                    "record": record.record_id, "encrypted": encrypted, "key_handle": key_handle,
                 })
             conn.execute(text("""INSERT INTO taxonomy_migrations
                 (migration_id, owner_person_id, proposal_id, receipt_json, status, rollback_until)
@@ -570,13 +618,28 @@ class GovernedContextRepository:
             restored_record_ids=tuple(str(item["record_id"]) for item in items),
             rolled_back_at=rolled_back,
         )
+        restored_crypto: dict[str, tuple[str, str]] = {}
+        for item in items:
+            prior = MemoryGovernance.model_validate_json(item["prior_governance_json"])
+            record = self.get_memory(actor, str(item["record_id"]))
+            if self.key_broker is not None:
+                handle = f"memory:{actor}:{prior.key_domain}"
+                cipher = base64.b64encode(self.key_broker.encrypt(key_handle=handle,
+                    plaintext=json.dumps(record.content, sort_keys=True).encode(),
+                    associated_data=record.record_id.encode())).decode()
+                restored_crypto[record.record_id] = (handle, cipher)
         with self.engine.begin() as conn:
             for item in items:
+                crypto = restored_crypto.get(str(item["record_id"]))
                 conn.execute(text("""UPDATE memory_records SET governance_json=:governance,
+                    content_ciphertext=COALESCE(:ciphertext, content_ciphertext),
+                    content_key_handle=COALESCE(:key_handle, content_key_handle),
                     revision=revision+1, updated_at=:at
                     WHERE record_id=:record AND owner_person_id=:owner"""), {
                     "governance": item["prior_governance_json"], "at": rolled_back.isoformat(),
                     "record": item["record_id"], "owner": actor,
+                    "key_handle": crypto[0] if crypto else None,
+                    "ciphertext": crypto[1] if crypto else None,
                 })
             conn.execute(text("UPDATE taxonomy_migrations SET status='rolled-back' WHERE migration_id=:id"),
                          {"id": migration_id})
@@ -981,9 +1044,19 @@ class GovernedContextRepository:
         return record
 
     def _record_from_row(self, row: Any) -> MemoryRecord:
+        content = _loads(row["content_json"], {})
+        if row.get("content_ciphertext"):
+            if self.key_broker is None:
+                raise ContextAccessDenied("encrypted memory requires the configured key broker")
+            plaintext = self.key_broker.decrypt(
+                key_handle=str(row["content_key_handle"]),
+                ciphertext=base64.b64decode(row["content_ciphertext"]),
+                associated_data=str(row["record_id"]).encode(),
+            )
+            content = json.loads(plaintext)
         return MemoryRecord(
             record_id=row["record_id"], owner_person_id=row["owner_person_id"],
-            space_id=row["space_id"], kind=row["kind"], content=_loads(row["content_json"], {}),
+            space_id=row["space_id"], kind=row["kind"], content=content,
             provenance=row["provenance"], source_record_id=row["source_record_id"],
             relationship_ids=tuple(_loads(row["relationship_ids_json"], [])),
             governance=MemoryGovernance.model_validate(_loads(row["governance_json"], {})),
@@ -1148,18 +1221,43 @@ class GovernedContextRepository:
                 })
         return plan
 
-    def claim_rebuild_jobs(self, actor: str, *, limit: int = 10) -> list[DerivedViewRebuildJob]:
+    def recover_expired_rebuild_jobs(self, actor: str, *, now: datetime | None = None) -> int:
+        """Return abandoned leases to the queue, exhausting bounded retries safely."""
+        instant = now or _now()
+        recovered = 0
+        with self.engine.begin() as conn:
+            rows = conn.execute(text("""SELECT job_id, job_json FROM derived_view_rebuild_jobs
+                WHERE owner_person_id=:owner AND state='running'"""), {"owner": actor}).mappings().all()
+            for row in rows:
+                job = DerivedViewRebuildJob.model_validate_json(row["job_json"])
+                if job.lease_expires_at and job.lease_expires_at <= instant:
+                    state = "failed" if job.attempts >= job.max_attempts else "pending"
+                    updated = job.model_copy(update={"state": state, "lease_owner": None,
+                        "lease_expires_at": None, "last_error": "worker lease expired", "updated_at": instant})
+                    conn.execute(text("""UPDATE derived_view_rebuild_jobs SET state=:state,
+                        job_json=:payload WHERE job_id=:id AND state='running'"""),
+                        {"state": state, "payload": updated.model_dump_json(), "id": job.job_id})
+                    recovered += 1
+        return recovered
+
+    def claim_rebuild_jobs(self, actor: str, *, limit: int = 10,
+                           worker_id: str = "local-worker", lease_seconds: int = 60) -> list[DerivedViewRebuildJob]:
         if limit < 1 or limit > 100:
             raise ValueError("rebuild claim limit must be between 1 and 100")
+        if not worker_id.strip() or lease_seconds < 5 or lease_seconds > 3600:
+            raise ValueError("worker identity and a 5-3600 second lease are required")
+        self.recover_expired_rebuild_jobs(actor)
+        instant = _now()
         with self.engine.begin() as conn:
             rows = conn.execute(text("""SELECT job_id, job_json FROM derived_view_rebuild_jobs
                 WHERE owner_person_id=:owner AND state='pending'
                 ORDER BY created_at, job_id LIMIT :limit"""), {"owner": actor, "limit": limit}).mappings().all()
             jobs = []
             for row in rows:
-                job = DerivedViewRebuildJob.model_validate_json(row["job_json"]).model_copy(
-                    update={"state": "running", "attempts": DerivedViewRebuildJob.model_validate_json(row["job_json"]).attempts + 1}
-                )
+                prior = DerivedViewRebuildJob.model_validate_json(row["job_json"])
+                job = prior.model_copy(update={"state": "running", "attempts": prior.attempts + 1,
+                    "lease_owner": worker_id, "lease_expires_at": instant + timedelta(seconds=lease_seconds),
+                    "updated_at": instant})
                 conn.execute(text("""UPDATE derived_view_rebuild_jobs SET state='running',
                     attempts=:attempts, job_json=:payload WHERE job_id=:id AND state='pending'"""), {
                     "attempts": job.attempts, "payload": job.model_dump_json(), "id": job.job_id,
@@ -1168,7 +1266,7 @@ class GovernedContextRepository:
         return jobs
 
     def complete_rebuild_job(
-        self, actor: str, job_id: str, *, view_id: str,
+        self, actor: str, job_id: str, *, view_id: str, worker_id: str = "local-worker",
     ) -> DerivedViewDescriptor:
         with self.engine.connect() as conn:
             row = conn.execute(text("""SELECT job_json, migration_id FROM derived_view_rebuild_jobs
@@ -1177,6 +1275,10 @@ class GovernedContextRepository:
         if not row:
             raise ContextAccessDenied("rebuild job is unavailable")
         job = DerivedViewRebuildJob.model_validate_json(row["job_json"])
+        if job.lease_owner != worker_id or not job.lease_expires_at or job.lease_expires_at <= _now():
+            raise ContextAccessDenied("rebuild worker does not hold a live lease")
+        if job.cancel_requested:
+            raise ContextAccessDenied("rebuild job cancellation was requested")
         source = self.get_memory(actor, job.source_record_id)
         if source.revision != job.source_revision:
             raise ValueError("rebuild source revision changed")
@@ -1187,7 +1289,8 @@ class GovernedContextRepository:
             algorithm=job.target_algorithm,
         )
         self.register_derived_view(actor, descriptor)
-        completed = job.model_copy(update={"state": "complete"})
+        completed = job.model_copy(update={"state": "complete", "lease_owner": None,
+                                           "lease_expires_at": None, "updated_at": _now()})
         with self.engine.begin() as conn:
             conn.execute(text("""UPDATE derived_view_rebuild_jobs SET state='complete',
                 job_json=:payload, completed_at=:at WHERE job_id=:id"""), {
@@ -1196,6 +1299,44 @@ class GovernedContextRepository:
         if row["migration_id"]:
             self._refresh_embedding_migration(actor, str(row["migration_id"]))
         return descriptor
+
+    def fail_rebuild_job(self, actor: str, job_id: str, *, worker_id: str,
+                         error: str, retryable: bool = True) -> DerivedViewRebuildJob:
+        with self.engine.begin() as conn:
+            raw = conn.execute(text("""SELECT job_json FROM derived_view_rebuild_jobs
+                WHERE job_id=:id AND owner_person_id=:owner AND state='running'"""),
+                {"id": job_id, "owner": actor}).scalar()
+            if not raw:
+                raise ContextAccessDenied("rebuild job is unavailable")
+            job = DerivedViewRebuildJob.model_validate_json(raw)
+            if job.lease_owner != worker_id:
+                raise ContextAccessDenied("rebuild worker does not hold the lease")
+            state = "pending" if retryable and job.attempts < job.max_attempts else "failed"
+            updated = job.model_copy(update={"state": state, "lease_owner": None,
+                "lease_expires_at": None, "last_error": error[:1000], "updated_at": _now()})
+            conn.execute(text("UPDATE derived_view_rebuild_jobs SET state=:state, job_json=:payload WHERE job_id=:id"),
+                         {"state": state, "payload": updated.model_dump_json(), "id": job_id})
+        return updated
+
+    def cancel_rebuild_job(self, actor: str, job_id: str) -> DerivedViewRebuildJob:
+        with self.engine.begin() as conn:
+            raw = conn.execute(text("""SELECT job_json FROM derived_view_rebuild_jobs
+                WHERE job_id=:id AND owner_person_id=:owner AND state IN ('pending','running')"""),
+                {"id": job_id, "owner": actor}).scalar()
+            if not raw:
+                raise ContextAccessDenied("rebuild job is unavailable")
+            job = DerivedViewRebuildJob.model_validate_json(raw).model_copy(update={"state": "cancelled",
+                "cancel_requested": True, "lease_owner": None, "lease_expires_at": None, "updated_at": _now()})
+            conn.execute(text("UPDATE derived_view_rebuild_jobs SET state='cancelled', job_json=:payload WHERE job_id=:id"),
+                         {"payload": job.model_dump_json(), "id": job_id})
+        return job
+
+    def rebuild_metrics(self, actor: str) -> dict[str, int]:
+        self.recover_expired_rebuild_jobs(actor)
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""SELECT state, COUNT(*) AS count FROM derived_view_rebuild_jobs
+                WHERE owner_person_id=:owner GROUP BY state"""), {"owner": actor}).mappings().all()
+        return {str(row["state"]): int(row["count"]) for row in rows}
 
     def _refresh_embedding_migration(self, actor: str, migration_id: str) -> EmbeddingMigrationPlan:
         with self.engine.connect() as conn:

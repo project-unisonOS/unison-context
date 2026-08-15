@@ -2,19 +2,35 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine, text
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from governed_repository import AmbiguousContext, ContextAccessDenied, GovernedContextRepository
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
 from unison_common.household import HouseholdCoordinationRequest
+from unison_common.trust import LocalDevelopmentKeyBroker
 from unison_common.governed_memory import (
     AlgorithmProvenance, DataDomainDefinition, DerivedViewDescriptor, MemoryRetrievalRequest,
-    TaxonomyDecision, TaxonomyMigrationCommand, TaxonomySecurityReview, TaxonomyUsageSignal,
+    SignedTaxonomyPolicyIssuance, TaxonomyDecision, TaxonomyMigrationCommand,
+    TaxonomySecurityReview, TaxonomyUsageSignal,
 )
 
 
 @pytest.fixture
 def repo(tmp_path):
-    return GovernedContextRepository(create_engine(f"sqlite:///{tmp_path / 'context.db'}", future=True))
+    policy_key = Ed25519PrivateKey.generate()
+    result = GovernedContextRepository(create_engine(f"sqlite:///{tmp_path / 'context.db'}", future=True),
+        key_broker=LocalDevelopmentKeyBroker(b"test-root-secret-for-context-only-32"),
+        taxonomy_policy_public_key=policy_key.public_key())
+    result._test_policy_key = policy_key
+    return result
+
+
+def _accept_review(repo, review):
+    now = datetime.now(timezone.utc)
+    issuance = SignedTaxonomyPolicyIssuance(issuance_id=f"issuance-{review.review_id}",
+        owner_person_id="alice", proposal_id=review.proposal_id, review=review,
+        issued_at=now, expires_at=now + timedelta(minutes=5), key_id="test-policy").sign(repo._test_policy_key)
+    return repo.accept_taxonomy_policy_issuance("alice", issuance)
 
 
 def _people(repo):
@@ -319,7 +335,7 @@ def test_usage_evidence_proposes_but_never_activates_without_person_approval(rep
     assert repo.list_taxonomy_domains("alice") == []
     assert repo.list_taxonomy_proposals("bob") == []
 
-    repo.record_taxonomy_security_review("alice", TaxonomySecurityReview(
+    _accept_review(repo, TaxonomySecurityReview(
         review_id="review-existing-legal", proposal_id=proposal.proposal_id, decision="approve",
         policy_version="taxonomy-policy.v1", separate_key_boundary=True,
         retention_reviewed=True, sharing_reviewed=True, disclosure_reviewed=True,
@@ -382,7 +398,7 @@ def test_natural_preview_and_security_review_gate_activation(repo):
     )
     with pytest.raises(ValueError, match="security review"):
         repo.decide_taxonomy_proposal("alice", decision)
-    repo.record_taxonomy_security_review("alice", TaxonomySecurityReview(
+    _accept_review(repo, TaxonomySecurityReview(
         review_id="review-legal", proposal_id=proposal.proposal_id, decision="approve",
         policy_version="taxonomy-policy.v1", separate_key_boundary=True,
         retention_reviewed=True, sharing_reviewed=True, disclosure_reviewed=True,
@@ -399,7 +415,7 @@ def test_migration_preview_confirmation_staleness_and_rollback(repo):
         governance=MemoryGovernance(data_domains=("core-private",), key_domain="core-private"),
     )
     proposal = _security_proposal(repo)
-    repo.record_taxonomy_security_review("alice", TaxonomySecurityReview(
+    _accept_review(repo, TaxonomySecurityReview(
         review_id="review-migration", proposal_id=proposal.proposal_id, decision="approve",
         policy_version="taxonomy-policy.v1", separate_key_boundary=True,
         retention_reviewed=True, sharing_reviewed=True, disclosure_reviewed=True,
@@ -426,11 +442,40 @@ def test_migration_preview_confirmation_staleness_and_rollback(repo):
     migrated = repo.get_memory("alice", record.record_id)
     assert migrated.governance.key_domain == "legal"
     assert "legal" in migrated.governance.data_domains
+    with repo.engine.connect() as conn:
+        stored = conn.execute(text("SELECT content_json, content_ciphertext, content_key_handle FROM memory_records WHERE record_id=:id"),
+                              {"id": record.record_id}).mappings().one()
+    assert stored["content_json"] == "{}"
+    assert stored["content_ciphertext"] and stored["content_key_handle"] == "memory:alice:legal"
     rollback = repo.rollback_taxonomy_migration("alice", receipt.migration_id)
     assert rollback.restored_record_ids == (record.record_id,)
     restored = repo.get_memory("alice", record.record_id)
     assert restored.governance.key_domain == "core-private"
     assert restored.governance.data_domains == ("core-private",)
+    assert restored.content == {"synthetic": "document"}
+
+
+def test_rebuild_worker_leases_retries_cancellation_and_observability(repo):
+    private, _ = _people(repo)
+    record = repo.admit_memory("alice", space_id=private.space_id,
+        kind=MemoryKind.ASSERTED_FACT, content={"value": "lease-test"}, provenance="test")
+    source = AlgorithmProvenance(algorithm_id="embed-lease", algorithm_version="1")
+    repo.register_derived_view("alice", DerivedViewDescriptor(view_id="old-lease-view",
+        view_kind="embedding", source_record_id=record.record_id, source_revision=1,
+        space_id=private.space_id, data_domains=("core-private",), index_namespace="old-lease",
+        algorithm=source))
+    repo.begin_embedding_migration("alice", source_algorithm_id="embed-lease",
+        target_algorithm=AlgorithmProvenance(algorithm_id="embed-lease", algorithm_version="2"),
+        source_namespace="old-lease", target_namespace="new-lease")
+    job = repo.claim_rebuild_jobs("alice", worker_id="worker-a", lease_seconds=5)[0]
+    with pytest.raises(ContextAccessDenied, match="live lease"):
+        repo.complete_rebuild_job("alice", job.job_id, view_id="bad", worker_id="worker-b")
+    retried = repo.fail_rebuild_job("alice", job.job_id, worker_id="worker-a",
+                                    error="injected transient failure")
+    assert retried.state == "pending" and retried.last_error == "injected transient failure"
+    claimed = repo.claim_rebuild_jobs("alice", worker_id="worker-b", lease_seconds=5)[0]
+    assert repo.cancel_rebuild_job("alice", claimed.job_id).state == "cancelled"
+    assert repo.rebuild_metrics("alice")["cancelled"] == 1
 
 
 def test_dual_index_rebuild_swap_and_rollback(repo):
