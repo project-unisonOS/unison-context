@@ -40,6 +40,7 @@ from fastapi import APIRouter
 # Import settings as a top-level module since PYTHONPATH is set in the Dockerfile
 from settings import DEFAULT_CONTEXT_DB_PATH, ContextServiceSettings
 from governed_repository import AmbiguousContext, GovernedContextRepository
+from resolution_repository import ResolutionRepository
 from interaction_profiles import InteractionProfileRepository
 from unison_common import SituationalOverride
 from unison_common.governed_context import MemberRole, MemoryGovernance, MemoryKind, SpaceKind
@@ -49,6 +50,7 @@ from unison_common.governed_memory import (
     TaxonomyUsageSignal,
 )
 from unison_common.household import HouseholdCoordinationRequest
+from unison_common.resolution import CandidateTransition, DeterminizationCandidate, ResolutionAttempt, ResolutionReceipt
 
 app = FastAPI(title="unison-context")
 app.add_middleware(TracingMiddleware, service_name="unison-context")
@@ -88,6 +90,7 @@ _start_time = time.time()
 _conversation_store: Dict[str, Dict[str, Any]] = {}
 _ENGINE: Engine | None = None
 _GOVERNED: GovernedContextRepository | None = None
+_RESOLUTION: ResolutionRepository | None = None
 _INTERACTION_PROFILES: InteractionProfileRepository | None = None
 _DB_PATH: Path = Path(os.getenv("UNISON_CONTEXT_DB_PATH", DEFAULT_CONTEXT_DB_PATH))
 _PROFILE_KEY: Optional[bytes] = None
@@ -146,7 +149,7 @@ def _index_key(key: str) -> str:
 
 def _init_db():
     """Initialize storage backend (Postgres via SQLAlchemy or SQLite fallback)."""
-    global _ENGINE, _GOVERNED, _INTERACTION_PROFILES
+    global _ENGINE, _GOVERNED, _INTERACTION_PROFILES, _RESOLUTION
     db_url = _DB_URL or f"sqlite:///{_DB_PATH}"
     if os.getenv("ENVIRONMENT") == "prod" and db_url.startswith("sqlite"):
         raise RuntimeError("SQLite is not allowed in production; set UNISON_CONTEXT_DATABASE_URL to Postgres")
@@ -190,6 +193,7 @@ def _init_db():
     _GOVERNED = GovernedContextRepository(_ENGINE, key_broker=_KEY_BROKER,
                                            taxonomy_policy_public_key=policy_key)
     _INTERACTION_PROFILES = InteractionProfileRepository(_ENGINE)
+    _RESOLUTION = ResolutionRepository(_ENGINE)
 
 
 def _caller_person_id(request: Request, requested: str) -> str:
@@ -1296,6 +1300,45 @@ def governed_cancel_rebuild_job(job_id: str, request: Request, body: Dict[str, A
 def governed_rebuild_metrics(request: Request, person_id: str | None = None):
     actor, _ = _governed_actor(request, person_id)
     return {"states": _repo().rebuild_metrics(actor)}
+
+
+def _resolution_repo() -> ResolutionRepository:
+    if _RESOLUTION is None:
+        raise RuntimeError("resolution repository is not initialized")
+    return _RESOLUTION
+
+
+@app.post("/v1/resolution/attempts")
+def create_resolution_attempt(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    value = dict(body.get("attempt") or body); value.pop("person_id", None); value["owner_person_id"] = actor
+    return {"attempt": _resolution_repo().put_attempt(actor, ResolutionAttempt.model_validate(value)).model_dump(mode="json")}
+
+
+@app.post("/v1/resolution/receipts")
+def create_resolution_receipt(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    return {"receipt": _resolution_repo().complete(actor, ResolutionReceipt.model_validate(body["receipt"])).model_dump(mode="json")}
+
+
+@app.get("/v1/resolution/repeated-patterns")
+def resolution_repeated_patterns(request: Request, person_id: str | None = None, minimum: int = 2):
+    actor, _ = _governed_actor(request, person_id)
+    return {"patterns": _resolution_repo().repeated_fingerprints(actor, minimum)}
+
+
+@app.post("/v1/determinization/candidates")
+def create_determinization_candidate(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    return {"candidate": _resolution_repo().propose_candidate(
+        actor, DeterminizationCandidate.model_validate(body["candidate"])).model_dump(mode="json")}
+
+
+@app.post("/v1/determinization/candidates/{candidate_id}/transitions")
+def transition_determinization_candidate(candidate_id: str, request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    value = dict(body["transition"]); value["candidate_id"] = candidate_id
+    return {"candidate": _resolution_repo().transition(actor, CandidateTransition.model_validate(value)).model_dump(mode="json")}
 
 
 @app.post("/v2/memory/embedding-migrations/{migration_id}/cutover")
