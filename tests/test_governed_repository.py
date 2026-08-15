@@ -431,3 +431,42 @@ def test_migration_preview_confirmation_staleness_and_rollback(repo):
     restored = repo.get_memory("alice", record.record_id)
     assert restored.governance.key_domain == "core-private"
     assert restored.governance.data_domains == ("core-private",)
+
+
+def test_dual_index_rebuild_swap_and_rollback(repo):
+    private, _ = _people(repo)
+    record = repo.admit_memory(
+        "alice", space_id=private.space_id, kind=MemoryKind.ASSERTED_FACT,
+        content={"synthetic": "rebuild-source"}, provenance="synthetic",
+        governance=MemoryGovernance(data_domains=("core-private",), key_domain="core-private"),
+    )
+    old_algorithm = AlgorithmProvenance(algorithm_id="embed-old", algorithm_version="1")
+    new_algorithm = AlgorithmProvenance(algorithm_id="embed-new", algorithm_version="2")
+    repo.register_derived_view("alice", DerivedViewDescriptor(
+        view_id="old-index-view", view_kind="embedding", source_record_id=record.record_id,
+        source_revision=record.revision, space_id=record.space_id,
+        data_domains=("core-private",), index_namespace="index:alice:v1",
+        algorithm=old_algorithm,
+    ))
+    plan = repo.begin_embedding_migration(
+        "alice", source_algorithm_id="embed-old", target_algorithm=new_algorithm,
+        source_namespace="index:alice:v1", target_namespace="index:alice:v2",
+    )
+    assert plan.strategy == "dual-index-rebuild-and-swap"
+    assert plan.total_jobs == 1
+    job = repo.claim_rebuild_jobs("alice", limit=1)[0]
+    replacement = repo.complete_rebuild_job("alice", job.job_id, view_id="new-index-view")
+    assert replacement.index_namespace == "index:alice:v2"
+    cutover = repo.cutover_embedding_migration("alice", plan.migration_id)
+    assert cutover.state == "cutover"
+    with repo.engine.connect() as conn:
+        states = dict(conn.execute(text(
+            "SELECT view_id, state FROM derived_memory_views ORDER BY view_id"
+        )).all())
+    assert states == {"new-index-view": "active", "old-index-view": "superseded"}
+    assert repo.rollback_embedding_migration("alice", plan.migration_id).state == "rolled-back"
+    with repo.engine.connect() as conn:
+        states = dict(conn.execute(text(
+            "SELECT view_id, state FROM derived_memory_views ORDER BY view_id"
+        )).all())
+    assert states == {"new-index-view": "invalidated", "old-index-view": "active"}
