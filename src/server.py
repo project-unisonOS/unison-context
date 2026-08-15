@@ -50,7 +50,9 @@ from unison_common.governed_memory import (
     TaxonomyUsageSignal,
 )
 from unison_common.household import HouseholdCoordinationRequest
-from unison_common.resolution import CandidateTransition, DeterminizationCandidate, ResolutionAttempt, ResolutionReceipt
+from unison_common.resolution import (CandidateTransition, DeterminizationCandidate,
+                                      ResolutionAttempt, ResolutionPilotSignal,
+                                      ResolutionReceipt)
 
 app = FastAPI(title="unison-context")
 app.add_middleware(TracingMiddleware, service_name="unison-context")
@@ -1325,6 +1327,21 @@ def create_resolution_receipt(request: Request, body: Dict[str, Any] = Body(...)
 def resolution_repeated_patterns(request: Request, person_id: str | None = None, minimum: int = 2):
     actor, _ = _governed_actor(request, person_id)
     return {"patterns": _resolution_repo().repeated_fingerprints(actor, minimum)}
+
+
+@app.post("/v1/resolution/pilot-signals")
+def create_resolution_pilot_signal(request: Request, body: Dict[str, Any] = Body(...)):
+    actor, _ = _governed_actor(request, body.get("person_id"))
+    value = dict(body["signal"])
+    value["participant_id"] = actor
+    signal = _resolution_repo().record_pilot_signal(actor, ResolutionPilotSignal.model_validate(value))
+    return {"signal": signal.model_dump(mode="json")}
+
+
+@app.get("/v1/resolution/pilot-summary")
+def resolution_pilot_summary(request: Request, person_id: str | None = None):
+    actor, _ = _governed_actor(request, person_id)
+    return {"summary": _resolution_repo().pilot_summary(actor)}
 
 
 @app.post("/v1/determinization/candidates")
