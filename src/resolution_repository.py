@@ -2,7 +2,9 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from sqlalchemy import Engine, text
-from unison_common.resolution import CandidateTransition, DeterminizationCandidate, ResolutionAttempt, ResolutionReceipt
+from unison_common.resolution import (CandidateTransition, DeterminizationCandidate,
+                                      ResolutionAttempt, ResolutionPilotSignal,
+                                      ResolutionReceipt)
 
 ORDER = ["observed", "proposed", "specified", "tested", "reviewed", "signed", "canary", "promoted"]
 
@@ -25,6 +27,10 @@ class ResolutionRepository:
             conn.execute(text("""CREATE TABLE IF NOT EXISTS candidate_transitions (
                 candidate_id TEXT NOT NULL, owner_person_id TEXT NOT NULL, transitioned_at TEXT NOT NULL,
                 transition_json TEXT NOT NULL, PRIMARY KEY(candidate_id, transitioned_at))"""))
+            conn.execute(text("""CREATE TABLE IF NOT EXISTS resolution_pilot_signals (
+                signal_id TEXT PRIMARY KEY, owner_person_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL, signal_json TEXT NOT NULL,
+                created_at TEXT NOT NULL)"""))
 
     def put_attempt(self, actor: str, attempt: ResolutionAttempt) -> ResolutionAttempt:
         if attempt.owner_person_id != actor:
@@ -61,7 +67,9 @@ class ResolutionRepository:
 
     def propose_candidate(self, actor: str, candidate: DeterminizationCandidate) -> DeterminizationCandidate:
         for attempt_id in candidate.evidence_attempt_ids:
-            self.get_attempt(actor, attempt_id)
+            attempt = self.get_attempt(actor, attempt_id)
+            if attempt.structural_fingerprint != candidate.structural_fingerprint:
+                raise ValueError("candidate evidence fingerprint does not match")
         with self.engine.begin() as conn:
             conn.execute(text("""INSERT INTO determinization_candidates
                 (candidate_id, owner_person_id, fingerprint, state, candidate_json, created_at)
@@ -69,6 +77,33 @@ class ResolutionRepository:
                 {"id": candidate.candidate_id, "owner": actor, "fingerprint": candidate.structural_fingerprint,
                  "state": candidate.state, "payload": candidate.model_dump_json(), "created": candidate.created_at.isoformat()})
         return candidate
+
+    def record_pilot_signal(self, actor: str, signal: ResolutionPilotSignal) -> ResolutionPilotSignal:
+        if signal.participant_id != actor:
+            raise ResolutionAccessDenied("pilot signal is unavailable")
+        self.get_attempt(actor, signal.attempt_id)
+        with self.engine.begin() as conn:
+            conn.execute(text("""INSERT INTO resolution_pilot_signals
+                (signal_id, owner_person_id, attempt_id, signal_json, created_at)
+                VALUES (:id,:owner,:attempt,:payload,:created)"""),
+                {"id": signal.signal_id, "owner": actor, "attempt": signal.attempt_id,
+                 "payload": signal.model_dump_json(), "created": signal.created_at.isoformat()})
+        return signal
+
+    def pilot_summary(self, actor: str) -> dict[str, object]:
+        with self.engine.connect() as conn:
+            raw = conn.execute(text("""SELECT signal_json FROM resolution_pilot_signals
+                WHERE owner_person_id=:owner ORDER BY created_at"""), {"owner": actor}).scalars().all()
+        signals = [ResolutionPilotSignal.model_validate_json(item) for item in raw]
+        suggested = [item for item in signals if item.candidate_suggested]
+        def rate(count: int, total: int) -> float:
+            return round(100 * count / total, 1) if total else 0.0
+        return {"attempts": len(signals),
+            "useful_or_partial_percent": rate(sum(item.usefulness != "not-useful" for item in signals), len(signals)),
+            "generic_refusal_percent": rate(sum(item.generic_refusal for item in signals), len(signals)),
+            "candidate_suggestions": len(suggested),
+            "candidate_precision_percent": rate(sum(item.candidate_relevant is True for item in suggested), len(suggested)),
+            "boundary_incidents": sum(item.boundary_incident for item in signals)}
 
     def transition(self, actor: str, transition: CandidateTransition) -> DeterminizationCandidate:
         with self.engine.connect() as conn:
